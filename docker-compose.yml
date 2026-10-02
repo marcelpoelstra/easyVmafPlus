@@ -1,0 +1,12 @@
+# Build and run easyVmafPlus with Docker Compose:
+#   docker compose build
+#   docker compose run --rm easyvmafplus -r /videos/BBB_reference_10s.mp4 -d /videos/BBB_sampleA_distorted.mp4 -sw 1 -ss 1
+# VIDEO_DIR sets the folder mounted on /videos; the default is ./video_samples.
+services:
+  easyvmafplus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: easyvmafplus:latest
+    volumes:
+      - ${VIDEO_DIR:-./video_samples}:/videos

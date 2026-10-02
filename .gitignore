@@ -1,6 +1,11 @@
+*.mp4
 *.log
 *.code-workspace
 __pycache__
+*.egg-info/
+dist/
+build/
+.venv/
 .vscode/
 
 met_2000.ismv
@@ -11,3 +16,4 @@ video_samples/BBB_sampleB_distorted_vmaf.json
 met_2000_vmaf.json
 requirements.txt
 workdocuments/
+CLAUDE.md
