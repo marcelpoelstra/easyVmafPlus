@@ -196,16 +196,14 @@ docker build -t easyvmafplus .
 docker build --platform linux/amd64 -t easyvmafplus:amd64 .
 ```
 
-On an Apple silicon Mac, the `linux/amd64` build runs under QEMU emulation and takes much longer than a native build. QEMU 7.0.0 crashed the compiler during this build. QEMU 10.2.3 from `tonistiigi/binfmt` builds it correctly:
+On an Apple silicon Mac, the `linux/amd64` build must run under QEMU emulation 
 
 ```bash
 docker run --privileged --rm tonistiigi/binfmt --uninstall qemu-x86_64
 docker run --privileged --rm tonistiigi/binfmt --install amd64
 ```
 
-### Publishing
 
-The workflow `.github/workflows/docker-publish.yml` builds and pushes the image. It uses Docker's reusable [github-builder](https://github.com/docker/github-builder) workflow, which builds each platform on a native GitHub-hosted runner. A newly published GitHub package is private by default. Set its visibility in the package settings on GitHub.
 
 ## Licence
 
