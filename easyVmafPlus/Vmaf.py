@@ -23,6 +23,7 @@ SOFTWARE.
 """
 from .FFmpeg import FFprobe
 from .FFmpeg import FFmpegQos
+from .FFmpeg import select_models
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List
@@ -31,6 +32,10 @@ import math
 import os
 
 logger = logging.getLogger(__name__)
+
+# The VMAF v1 HFR models are calibrated for the ~50/60 fps regime
+# (Netflix/vmaf v3.2.1, resource/doc/models_v1.md)
+HFR_MIN_FPS = 50
 
 
 @dataclass
@@ -155,7 +160,7 @@ class vmaf():
         - Frame rate conversion (if needed)
     """
 
-    def __init__(self, mainSrc, refSrc, output_fmt, model="HD", phone=False, loglevel="info", subsample=1, threads=0, print_progress=False, end_sync=False,  manual_fps=0, cambi_heatmap=False):
+    def __init__(self, mainSrc, refSrc, output_fmt, model="HD", phone=False, loglevel="info", subsample=1, threads=0, print_progress=False, end_sync=False,  manual_fps=0, cambi_heatmap=False, vmaf_v0=False, disable_hfr=False):
         self.loglevel = loglevel
         self.main = video(mainSrc, self.loglevel)
         self.ref = video(refSrc, self.loglevel)
@@ -173,6 +178,9 @@ class vmaf():
         self.print_progress = print_progress
         self.end_sync = end_sync
         self.cambi_heatmap = cambi_heatmap
+        self.vmaf_v0 = vmaf_v0
+        self.disable_hfr = disable_hfr
+        self.models = []
         self._filters_applied = False
 
     def _initResolutions(self):
@@ -220,22 +228,23 @@ class vmaf():
         self._applyScaleFilters(self.ffmpegQos)
         self._filters_applied = True
 
-    def _deinterlaceFrame(self, factor, stream):
+    def _deinterlaceFrame(self, factor, stream, fps):
+        """yadif frame mode on stream, then fps when REF is not exactly factor times MAIN"""
         ref_fps = getFrameRate(self.ref.streamInfo['r_frame_rate'])
         main_fps = getFrameRate(self.main.streamInfo['r_frame_rate'])
 
         stream.setDeintFrameFilter()
         if round(ref_fps, 2) != round(factor*main_fps, 2):
-            stream.setFpsFilter(round(main_fps, 5))
+            stream.setFpsFilter(round(fps, 5))
 
-    def _deinterlaceField(self, factor, stream):
-
+    def _deinterlaceField(self, factor, stream, fps):
+        """yadif field mode on stream, then fps when REF is not exactly factor times MAIN"""
         ref_fps = getFrameRate(self.ref.streamInfo['r_frame_rate'])
         main_fps = getFrameRate(self.main.streamInfo['r_frame_rate'])
 
         stream.setDeintFieldFilter()
         if round(ref_fps, 2) != round(factor*main_fps, 2):
-            stream.setFpsFilter(round(main_fps, 5))
+            stream.setFpsFilter(round(fps, 5))
 
     def _applyDeinterlaceFilters(self, qos):
         """
@@ -279,27 +288,27 @@ class vmaf():
                 # Examples: REF=60i, MAIN=30p
                 # REF=59.97i, MAIN=30p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(2, qos.ref)
+                    self._deinterlaceFrame(2, qos.ref, main_fps)
                 else:
-                    self._deinterlaceFrame(2, qos.main)
+                    self._deinterlaceFrame(2, qos.main, main_fps)
 
             elif round(ref_fps) == round(main_fps):
                 # Examples:
                 # REF=30i, MAIN=30p
                 # REF=29.97i, MAIN=30p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(1, qos.ref)
+                    self._deinterlaceFrame(1, qos.ref, main_fps)
                 else:
-                    self._deinterlaceFrame(1, qos.main)
+                    self._deinterlaceFrame(1, qos.main, main_fps)
 
             elif round(ref_fps) == round(main_fps/2):
                 # Examples:
                 # REF=30i, MAIN=60p
                 # REF=29.97i, MAIN=60p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceField(0.5, qos.ref)
+                    self._deinterlaceField(0.5, qos.ref, main_fps)
                 else:
-                    self._deinterlaceField(0.5, qos.main)
+                    self._deinterlaceField(0.5, qos.main, main_fps)
 
             else:
                 raise UnsupportedFramerateError(unsupported)
@@ -311,29 +320,28 @@ class vmaf():
             if round(ref_fps) == round(main_fps*2):
                 # Examples: REF=60p, MAIN=30i
                 # REF=60p, MAIN=29.97i, etc
-                logger.warning("Frame rate conversion can produce bad vmaf scores")
                 if not qos.invertedSrc:
-                    self._deinterlaceField(1, qos.main)
+                    self._deinterlaceField(2, qos.main, ref_fps)
                 else:
-                    self._deinterlaceField(1, qos.ref)
+                    self._deinterlaceField(2, qos.ref, ref_fps)
 
             elif round(ref_fps) == round(main_fps):
                 # Examples:
                 # REF=30p, MAIN=30i
                 # REF=30p, MAIN=29.97i, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(1, qos.main)
+                    self._deinterlaceFrame(1, qos.main, ref_fps)
                 else:
-                    self._deinterlaceFrame(1, qos.ref)
+                    self._deinterlaceFrame(1, qos.ref, ref_fps)
 
             elif round(ref_fps) == round(main_fps/2):
                 # Examples:
                 # REF=30p, MAIN=60i
                 logger.warning("Frame rate conversion can produce bad vmaf scores")
                 if not qos.invertedSrc:
-                    self._deinterlaceField(0.5, qos.main)
+                    self._deinterlaceField(0.5, qos.main, ref_fps)
                 else:
-                    self._deinterlaceField(0.5, qos.ref)
+                    self._deinterlaceField(0.5, qos.ref, ref_fps)
 
             else:
                 raise UnsupportedFramerateError(unsupported)
@@ -348,6 +356,47 @@ class vmaf():
         logger.warning("Forcing frame rate conversion manually")
         self.ffmpegQos.main.setFpsFilter(self.manual_fps)
         self.ffmpegQos.ref.setFpsFilter(self.manual_fps)
+
+    def _comparedFrameRate(self):
+        """
+        Frame rate of the frames libvmaf compares, after _applyDeinterlaceFilters or _forceFps:
+        the -fps value; the lower frame rate of two progressive inputs; the frame rate of the
+        progressive input when the other is interlaced. None for two interlaced inputs: libvmaf
+        then compares interlaced frames, and the r_frame_rate of an interlaced stream can be
+        its field rate (the REF=60i, MAIN=30p case of _applyDeinterlaceFilters).
+        """
+        if self.manual_fps != 0:
+            return self.manual_fps
+        ref_fps = getFrameRate(self.ref.streamInfo['r_frame_rate'])
+        main_fps = getFrameRate(self.main.streamInfo['r_frame_rate'])
+        if self.ref.interlaced and self.main.interlaced:
+            return None
+        if self.ref.interlaced:
+            return main_fps
+        if self.main.interlaced:
+            return ref_fps
+        return min(ref_fps, main_fps)
+
+    def _useHfr(self):
+        """True for a v1 run without -disable_hfr whose compared frame rate is HFR_MIN_FPS or more"""
+        if self.vmaf_v0 or self.disable_hfr:
+            return False
+        rate = self._comparedFrameRate()
+        return rate is not None and rate >= HFR_MIN_FPS
+
+    def _cambiEncodeParams(self):
+        """
+        Encode-side width, height and bit depth of MAIN for the CAMBI feature of the
+        v1 models. Without bits_per_raw_sample CAMBI uses the input bit depth.
+        """
+        params = {
+            'cambi.enc_width': str(self.main.streamInfo['width']),
+            'cambi.enc_height': str(self.main.streamInfo['height']),
+        }
+        bitdepth = str(self.main.streamInfo.get('bits_per_raw_sample', ''))
+        if bitdepth.isdigit():
+            params['cambi.enc_bitdepth'] = bitdepth
+        return params
 
     def _computePsnrAtOffset(self, offset, reverse):
         """
@@ -487,7 +536,7 @@ class vmaf():
     def getVmaf(self, autoSync=False):
         """
         Filter order: clearFilters, _autoScale, _autoDeinterlace or _forceFps,
-        syncOffset when autoSync, setOffset.
+        syncOffset when autoSync, setOffset, and for the v1 models the 10-bit format.
         """
         self.ffmpegQos.clearFilters()
         self.ffmpegQos.main.clearFilters()
@@ -509,6 +558,16 @@ class vmaf():
             self.syncOffset()
         """Apply Offset filters, if offset =0 nothing happens """
         self.setOffset()
+
+        # VMAF v1: HFR variants, CAMBI encode parameters and 10-bit input
+        # (Netflix/vmaf v3.2.1, resource/doc/models_v1.md)
+        self.models = select_models(self.model, vmaf_v0=self.vmaf_v0, hfr=self._useHfr())
+        if not self.vmaf_v0:
+            cambi_params = self._cambiEncodeParams()
+            for model in self.models:
+                model.params.update(cambi_params)
+            self.ffmpegQos.main.setFormatFilter('yuv420p10le')
+            self.ffmpegQos.ref.setFormatFilter('yuv420p10le')
 
         self.features = self._build_feature_string()
 
@@ -533,7 +592,7 @@ class vmaf():
         logger.info("output_fmt: %s", self.output_fmt)
         logger.info("=" * 39)
 
-        vmafProcess = self.ffmpegQos.getVmaf(model=self.model, subsample=self.subsample,
+        vmafProcess = self.ffmpegQos.getVmaf(models=self.models, subsample=self.subsample,
                                              output_fmt=self.output_fmt, threads=self.threads, print_progress=self.print_progress, end_sync=self.end_sync, features=self.features, cambi_heatmap=self.cambi_heatmap)
         return vmafProcess
 

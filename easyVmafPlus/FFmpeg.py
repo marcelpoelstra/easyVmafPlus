@@ -24,6 +24,8 @@ SOFTWARE.
 
 
 from . import config
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 import re
 import subprocess
 import json
@@ -34,22 +36,75 @@ from ffmpeg_progress_yield import FfmpegProgress
 logger = logging.getLogger(__name__)
 
 
-# Each model: (libvmaf model version, score name in the VMAF log, extra model parameters)
+# VMAF v1 model files: copies of model/vmaf_v1.0.16 and model/vmaf_v1.0.16_hfr
+# of Netflix/vmaf v3.2.1, under the licence in models/LICENSE
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+VMAF_V1_VERSION = 'vmaf_v1.0.16'
+
+# Per model generation and -model value, each model: (score name in the VMAF log,
+# label in the results, source, extra model parameters). The source of a v0 model
+# is its libvmaf built-in version, the source of a v1 model its model file variant.
 VMAF_MODELS = {
-    'HD': [
-        ('vmaf_v0.6.1', 'vmaf_hd', {}),
-        ('vmaf_v0.6.1neg', 'vmaf_hd_neg', {}),
-        ('vmaf_v0.6.1', 'vmaf_hd_phone', {'enable_transform': 'true'}),
-    ],
-    '4K': [
-        ('vmaf_4k_v0.6.1', 'vmaf_4k', {}),
-    ],
+    'v0': {
+        'HD': [
+            ('vmaf_hd', 'VMAF HD', 'vmaf_v0.6.1', {}),
+            ('vmaf_hd_neg', 'VMAF Neg', 'vmaf_v0.6.1neg', {}),
+            ('vmaf_hd_phone', 'VMAF Phone', 'vmaf_v0.6.1', {'enable_transform': 'true'}),
+        ],
+        '4K': [
+            ('vmaf_4k', 'VMAF 4K', 'vmaf_4k_v0.6.1', {}),
+        ],
+    },
+    'v1': {
+        'HD': [
+            ('vmaf_v1_hd', 'VMAF v1 HD', '3d0h', {}),
+            ('vmaf_v1_hd_phone', 'VMAF v1 Phone', '5d0h', {}),
+        ],
+        '4K': [
+            ('vmaf_v1_4k', 'VMAF v1 4K', '1d5h_2160', {}),
+            ('vmaf_v1_4k_3h', 'VMAF v1 4K 3H', '3d0h_2160', {}),
+        ],
+    },
 }
 
-HD_MODEL_NAME = VMAF_MODELS['HD'][0][1]
-HD_NEG_MODEL_NAME = VMAF_MODELS['HD'][1][1]
-HD_PHONE_MODEL_NAME = VMAF_MODELS['HD'][2][1]
-_4K_MODEL_NAME = VMAF_MODELS['4K'][0][1]
+
+@dataclass
+class ModelConfig:
+    """
+    One model of the libvmaf model= option: its score name in the VMAF log, its
+    label in the results, and its built-in version (v0) or model file path (v1).
+    """
+    name: str
+    label: str
+    version: Optional[str] = None
+    path: Optional[str] = None
+    params: Dict[str, str] = field(default_factory=dict)
+
+
+def v1_model_path(variant, hfr=False):
+    """Bundled VMAF v1 model file, e.g. models/vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_3d0h.json"""
+    stem = f'{VMAF_V1_VERSION}_hfr' if hfr else VMAF_V1_VERSION
+    return os.path.join(MODELS_DIR, stem, f'{stem}_{variant}.json')
+
+
+def select_models(model, vmaf_v0=False, hfr=False):
+    """
+    The models of a run for -model HD or 4K: the v0.6.1 models with vmaf_v0,
+    otherwise the v1 models, in their HFR variants with hfr.
+    """
+    generation = 'v0' if vmaf_v0 else 'v1'
+    if model not in VMAF_MODELS[generation]:
+        raise ValueError(f"Invalid VMAF model: {model!r}. Supported: {', '.join(VMAF_MODELS[generation])}")
+    models: List[ModelConfig] = []
+    for name, label, source, params in VMAF_MODELS[generation][model]:
+        if vmaf_v0:
+            models.append(ModelConfig(name, label, version=source, params=dict(params)))
+        elif hfr:
+            models.append(ModelConfig(f'{name}_hfr', f'{label} HFR',
+                                      path=v1_model_path(source, hfr=True), params=dict(params)))
+        else:
+            models.append(ModelConfig(name, label, path=v1_model_path(source), params=dict(params)))
+    return models
 
 
 class FFprobe:
@@ -175,16 +230,20 @@ class FFmpegQos:
         return [f'-{filterName}', ';'.join(filters)]
 
     @staticmethod
-    def _build_model_string(model):
+    def _build_model_string(models):
         """
-        The libvmaf model= value: per model its version, name and extra
-        parameters joined by escaped colons, the models joined by |.
+        The libvmaf model= value: per model its built-in version or model file path,
+        its name and extra parameters joined by escaped colons, the models joined by |.
+        A model file path, like heatmaps_path, passes one more option parser
+        (av_dict_parse_string in vf_libvmaf.c): option_levels=2.
         """
-        if model not in VMAF_MODELS:
-            raise ValueError(f"Invalid VMAF model: {model!r}. Supported: {', '.join(VMAF_MODELS)}")
         entries = []
-        for version, name, params in VMAF_MODELS[model]:
-            tokens = [f'version={version}', f'name={name}'] + [f'{k}={v}' for k, v in params.items()]
+        for model in models:
+            if model.version:
+                source = f'version={model.version}'
+            else:
+                source = f'path={FFmpegQos._escape_filter_value(model.path, option_levels=2)}'
+            tokens = [source, f'name={model.name}'] + [f'{k}={v}' for k, v in model.params.items()]
             entries.append('\\\\:'.join(tokens))
         return '|'.join(entries)
 
@@ -205,7 +264,10 @@ class FFmpegQos:
         psnr = [s for s in stdout if "average" in s][0].split(":")[1]
         return float(psnr)
 
-    def getVmaf(self, log_path=None, model='HD', subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features=None, cambi_heatmap=False):
+    def getVmaf(self, log_path=None, models=None, subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features=None, cambi_heatmap=False):
+        if models is None:
+            # the default of the former model='HD': the v0.6.1 HD models
+            models = select_models('HD', vmaf_v0=True)
         log_fmt = output_fmt if output_fmt in ('xml', 'csv') else 'json'
         if log_path is None:
             log_path = os.path.splitext(self.main.videoSrc)[0] + f'_vmaf.{log_fmt}'
@@ -217,7 +279,7 @@ class FFmpegQos:
         shortest = 1 if end_sync else 0
 
         params = (f'log_fmt={log_fmt}'
-                  f':model={self._build_model_string(model)}'
+                  f':model={self._build_model_string(models)}'
                   f':n_subsample={subsample}'
                   f':log_path={self._escape_filter_value(log_path)}'
                   f':n_threads={threads}'
@@ -263,6 +325,7 @@ class inputFFmpeg:
     - setDeintFieldFilter()
     - setTrimFilter()
     - setFpsFilter()
+    - setFormatFilter()
     - clearFilters()
     '''
 
@@ -337,6 +400,12 @@ class inputFFmpeg:
         self._setFilter(fpsFilter)
         self._updateOutputId(outputID)
 
+    def setFormatFilter(self, pix_fmt):
+        inputID, outputID = self._newInOutForFilter()
+        formatFilter = f'[{inputID}]format={pix_fmt}[{outputID}]'
+        self._setFilter(formatFilter)
+        self._updateOutputId(outputID)
+
     def clearFilters(self):
         self.filtersList = []
         self.lastOutputID = f'{str(self.id)}:v'
@@ -348,24 +417,26 @@ def check_ffmpeg():
 
     Returns a dict with:
         'version_str':    'X.Y' from the ffmpeg version line, 'dev-build' when it has none
-        'meets_minimum':  True for FFmpeg 5.0 and later, and for dev builds
+        'meets_minimum':  True for FFmpeg 9.0 and later, and for dev builds
         'libvmaf':        True when 'ffmpeg -filters' lists libvmaf
         'builtin_models': False when libvmaf cannot load the built-in model vmaf_v0.6.1
+        'v1_models':      True when libvmaf runs the bundled VMAF v1 model vmaf_v1.0.16_3d0h
 
     Raises:
         RuntimeError: when the ffmpeg or ffprobe binary is not found or cannot be run
     """
     if not FFmpegQos._executable:
-        raise RuntimeError("ffmpeg not found on PATH. Install FFmpeg >= 5.0 built with "
+        raise RuntimeError("ffmpeg not found on PATH. Install FFmpeg >= 9.0 built with "
                            "--enable-libvmaf, or point the FFMPEG environment variable to it.")
     if not FFprobe._executable:
-        raise RuntimeError("ffprobe not found on PATH. Install FFmpeg >= 5.0, "
+        raise RuntimeError("ffprobe not found on PATH. Install FFmpeg >= 9.0, "
                            "or point the FFPROBE environment variable to it.")
     result = {
         'version_str': 'unknown',
         'meets_minimum': False,
         'libvmaf': False,
         'builtin_models': False,
+        'v1_models': False,
     }
 
     try:
@@ -381,7 +452,7 @@ def check_ffmpeg():
     if match:
         major, minor = int(match.group(1)), int(match.group(2))
         result['version_str'] = f'{major}.{minor}'
-        result['meets_minimum'] = (major, minor) >= (5, 0)
+        result['meets_minimum'] = (major, minor) >= (9, 0)
     else:
         result['version_str'] = 'dev-build'
         result['meets_minimum'] = True
@@ -402,4 +473,17 @@ def check_ffmpeg():
     ]
     probe = subprocess.run(probe_cmd, capture_output=True, text=True)
     result['builtin_models'] = 'could not load libvmaf model' not in probe.stderr + probe.stdout
+
+    # The v1 models fail on the 64x64 frames of the probe above, with "no feature
+    # 'cambi_hrs_1080_cmxv_17_vlt_0.06' at index 0"; 320x240 frames pass
+    v1_model = FFmpegQos._escape_filter_value(v1_model_path('3d0h'), option_levels=2)
+    v1_probe_cmd = [
+        FFmpegQos._executable,
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
+        '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
+        '-lavfi', f'libvmaf=model=path={v1_model}:log_fmt=json:log_path={os.devnull}',
+        '-f', 'null', '-'
+    ]
+    result['v1_models'] = subprocess.run(v1_probe_cmd, capture_output=True, text=True).returncode == 0
     return result

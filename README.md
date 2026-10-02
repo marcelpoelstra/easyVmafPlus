@@ -9,6 +9,8 @@ Details about how the original tool works can be found in [this OTTVerse article
 | Change | Details |
 |---|---|
 | Hardware accelerated decoding | Every ffmpeg run passes `-hwaccel auto` to both the distorted and the reference input. When no hardware decoder is available, FFmpeg decodes in software. |
+| VMAF v1 models | easyVmafPlus computes VMAF with the VMAF v1 models of libvmaf 3.2.1 by default, in their HFR variants at 50 frames per second or more. `-vmaf_v0` runs the v0.6.1 models, `-disable_hfr` the standard v1 models. See [VMAF models](#vmaf-models). |
+| More decoders in the Docker image | The image decodes JPEG XL with libjxl, AVS2 with libdavs2 and AVS3 with libuavs3d. FFmpeg 9.0 adds Animated WebP. |
 | `easyVmafPlus` command | easyVmafPlus is a Python package. `pipx install .` installs the `easyVmafPlus` command, which runs from any directory. |
 | Own Docker image | The Dockerfile builds FFmpeg and libvmaf from source and copies the code from this repository. The image is can be built for `linux/amd64` and `linux/arm64`. This repository offers ready built images under "Packages" |
 
@@ -21,21 +23,21 @@ easyVmafPlus includes the features of easyVmaf up to commit [cdcdd80](https://gi
 * `-json` prints the results as one JSON object per distorted file on stdout.
 * `-output_fmt` writes the VMAF log as `json`, `xml` or `csv`.
 * The sync passes run in parallel, as many at a time as `-threads`, or one per CPU core.
-* At start, easyVmafPlus checks that FFmpeg is 5.0 or later and has libvmaf with its built-in models.
+* At start, easyVmafPlus checks that FFmpeg is 9.0 or later and that libvmaf runs the VMAF v1 models, or with `-vmaf_v0` its built-in models.
 * Log messages go to stderr, with a timestamp.
 * File paths with special characters are escaped in the libvmaf filter options.
 * The command line follows the [libvmaf filter documentation](https://ffmpeg.org/ffmpeg-filters.html#libvmaf).
-* The VMAF models are the built-in models of FFmpeg 5.0 and later.
-* With the HD model, the HD, HD Neg and HD Phone scores are computed in one run.
+* With `-vmaf_v0`, the VMAF models are the built-in v0.6.1 models of libvmaf.
+* With `-vmaf_v0` and the HD model, the HD, HD Neg and HD Phone scores are computed in one run.
 
 ## Requirements
 
 | Requirement | Notes |
 |---|---|
 | Linux or macOS | |
-| Python 3.9 or later | Verified with Python 3.12 (Docker image) and Python 3.14 (macOS) |
+| Python 3.11 or later | Verified with Python 3.12 (Docker image) and Python 3.14 (macOS) |
 | [pipx](https://pipx.pypa.io/) | Installs the `easyVmafPlus` command, together with the Python module [ffmpeg-progress-yield](https://github.com/slhck/ffmpeg-progress-yield) |
-| FFmpeg 5.0 or later, built with libvmaf | Since easyVmaf 2.0 only FFmpeg 5.0 and later is supported. For older FFmpeg versions, use easyVmaf 1.3. |
+| FFmpeg 9.0 or later, built with libvmaf 3.2.1 or later | The VMAF v1 models need libvmaf 3.2.1 or later. |
 
 ## Installation
 
@@ -66,9 +68,10 @@ python3 -m venv .venv
 ```console
 $ easyVmafPlus -h
 usage: easyVmafPlus [-h] -d D -r R [-sw SW] [-ss SS] [-fps FPS] [-subsample N]
-                    [-reverse] [-model MODEL] [-threads THREADS] [-verbose]
-                    [-progress] [-endsync] [-output_fmt OUTPUT_FMT]
-                    [-cambi_heatmap] [-sync_only] [-json]
+                    [-reverse] [-model MODEL] [-vmaf_v0] [-disable_hfr]
+                    [-threads THREADS] [-verbose] [-progress] [-endsync]
+                    [-output_fmt OUTPUT_FMT] [-cambi_heatmap] [-sync_only]
+                    [-json]
 
 Script to easy compute VMAF using FFmpeg. It allows to deinterlace, scale and sync Ref and Distorted video samples automatically:                         
 
@@ -90,6 +93,8 @@ options:
   -subsample N          Specifies the subsampling of frames to speed up calculation. (default=1, None).
   -reverse              If enable, it Changes the default Autosync behaviour: The first frames of the Reference video are used as reference to sync with the Distorted one. (Default = Disable).
   -model MODEL          Vmaf Model. Options: HD, 4K. (Default: HD).
+  -vmaf_v0              Use the VMAF v0.6.1 models instead of the VMAF v1 models. (Default: false).
+  -disable_hfr          Do not use the VMAF v1 HFR models, which are picked at a compared frame rate of 50 fps or higher. (Default: false).
   -threads THREADS      number of threads, also the number of parallel sync passes (default=0, one per CPU core)
   -verbose              Activate verbose loglevel. (Default: info).
   -progress             Activate progress indicator for vmaf computation. (Default: false).
@@ -114,6 +119,23 @@ required arguments:
 | VMAF log, `<distorted name>_vmaf.json` (`_vmaf.xml` with `-output_fmt xml`, `_vmaf.csv` with `-output_fmt csv`) | Next to the distorted video |
 | CAMBI heatmap, `<distorted name>_cambi_heatmap` (with `-cambi_heatmap`) | Next to the distorted video |
 
+## VMAF models
+
+By default easyVmafPlus computes VMAF with the VMAF v1 models of libvmaf 3.2.1, described in the [libvmaf model documentation](https://github.com/Netflix/vmaf/blob/v3.2.1/resource/doc/models_v1.md). `-vmaf_v0` runs the v0.6.1 models instead.
+
+| `-model` | Default run | With `-vmaf_v0` |
+|---|---|---|
+| HD | `vmaf_v1_hd` (1080p, 3H), `vmaf_v1_hd_phone` (phone, 5H) | `vmaf_hd`, `vmaf_hd_neg`, `vmaf_hd_phone` |
+| 4K | `vmaf_v1_4k` (2160p, 1.5H), `vmaf_v1_4k_3h` (2160p, 3H, scores up to 110) | `vmaf_4k` |
+
+These are the score names in the VMAF log and in the `-json` output.
+
+When the frames are compared at 50 frames per second or more, the v1 models run in their HFR variants, and the score names end in `_hfr`. The compared frame rate is the `-fps` value, or else the lower frame rate of two progressive inputs. With one interlaced input, it is the frame rate of the progressive input. Two interlaced inputs keep the standard v1 models, and so does `-disable_hfr`.
+
+A v1 run converts both inputs to 10 bits (`yuv420p10le`), as the libvmaf documentation recommends. It also passes the width, height and bit depth of the distorted video to the CAMBI feature of the v1 models.
+
+The v1 model files ship with easyVmafPlus in `easyVmafPlus/models/`, under the BSD+Patent licence of libvmaf: see [easyVmafPlus/models/LICENSE](easyVmafPlus/models/LICENSE).
+
 ## Sync examples
 
 The examples use the samples in `video_samples/`. Run them from that directory.
@@ -133,9 +155,8 @@ Results: BBB_sampleA_distorted.mp4
 VMAF computed
 =======================================
 offset:  1.5  | psnr:  40.032121
-VMAF HD:  90.86849254117647
-VMAF Neg:  88.9895249254902
-VMAF Phone:  99.9116301372549
+VMAF v1 HD:  93.25625810196078
+VMAF v1 Phone:  95.39317779607843
 VMAF output file path:  BBB_sampleA_distorted_vmaf.json
 ```
 
@@ -154,9 +175,8 @@ Results: BBB_sampleB_distorted.mp4
 VMAF computed
 =======================================
 offset:  -1.0  | psnr:  37.254979
-VMAF HD:  55.61167999607843
-VMAF Neg:  53.97209485098039
-VMAF Phone:  74.38952342745098
+VMAF v1 HD:  69.45323145490197
+VMAF v1 Phone:  75.73841608235294
 VMAF output file path:  BBB_sampleB_distorted_vmaf.json
 ```
 
@@ -166,12 +186,22 @@ With `-json`, stdout carries one JSON object per distorted file. The log message
 
 ```console
 $ easyVmafPlus -r BBB_reference_10s.mp4 -d BBB_sampleA_distorted.mp4 -sw 1 -ss 1 -json 2>/dev/null
-{"distorted": "BBB_sampleA_distorted.mp4", "reference": "BBB_reference_10s.mp4", "sync": {"offset": 1.5, "psnr": 40.032121}, "vmaf": {"model": "HD", "vmaf_hd": 90.868493, "vmaf_hd_neg": 88.989525, "vmaf_hd_phone": 99.91163, "output_file": "BBB_sampleA_distorted_vmaf.json"}}
+{"distorted": "BBB_sampleA_distorted.mp4", "reference": "BBB_reference_10s.mp4", "sync": {"offset": 1.5, "psnr": 40.032121}, "vmaf": {"model": "HD", "vmaf_v1_hd": 93.256258, "vmaf_v1_hd_phone": 95.393178, "output_file": "BBB_sampleA_distorted_vmaf.json"}}
 ```
 
 ## Docker image
 
-The image `ghcr.io/marcelpoelstra/easyvmafplus` is published to the GitHub Container Registry for `linux/amd64` and `linux/arm64`. It is based on `python:3.12-slim`, with FFmpeg 8.1 and libvmaf 3.0.0 built from source. See the [Dockerfile](Dockerfile) for details.
+The image `ghcr.io/marcelpoelstra/easyvmafplus` is published to the GitHub Container Registry for `linux/amd64` and `linux/arm64`. It is based on `python:3.12-slim`, with FFmpeg 9.0.2, libvmaf 3.2.1, davs2 1.7 and uavs3d 1.2 built from source. See the [Dockerfile](Dockerfile) for details.
+
+FFmpeg in the image includes libdavs2, which is GPL, so the FFmpeg build is licensed under GPL version 3 or later. It is built from these sources:
+
+| Component | Source |
+|---|---|
+| FFmpeg 9.0.2 | `https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.2.tar.gz` |
+| libvmaf 3.2.1 | `https://github.com/Netflix/vmaf/archive/v3.2.1.tar.gz` |
+| davs2 1.7 | `https://github.com/pkuvcl/davs2/archive/refs/tags/1.7.tar.gz` |
+| uavs3d 1.2 | `https://github.com/uavs3/uavs3d/archive/refs/tags/1.2.tar.gz` |
+| dav1d, libjxl | Debian 13 packages `dav1d` and `libjxl0.11` |
 
 | Tag | Published on |
 |---|---|
@@ -216,10 +246,10 @@ docker build -t easyvmafplus .
 docker build --platform linux/amd64 -t easyvmafplus:amd64 .
 ```
 
-The FFmpeg and libvmaf versions are build arguments. These are the defaults:
+The FFmpeg, libvmaf, davs2 and uavs3d versions are build arguments. These are the defaults:
 
 ```bash
-docker build --build-arg FFMPEG_version=8.1 --build-arg VMAF_version=3.0.0 -t easyvmafplus .
+docker build --build-arg FFMPEG_version=9.0.2 --build-arg VMAF_version=3.2.1 --build-arg DAVS2_version=1.7 --build-arg UAVS3D_version=1.2 -t easyvmafplus .
 ```
 
 On an Apple silicon Mac, the `linux/amd64` build must run under QEMU emulation 
@@ -243,4 +273,4 @@ VIDEO_DIR=<local-path-to-your-video-files> docker compose run --rm easyvmafplus 
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). The original easyVmaf is written by Gabriel Davila.
+MIT, see [LICENSE](LICENSE). The original easyVmaf is written by Gabriel Davila. The VMAF v1 model files in `easyVmafPlus/models/` are under the BSD+Patent licence of libvmaf, see [easyVmafPlus/models/LICENSE](easyVmafPlus/models/LICENSE). The FFmpeg build in the Docker image is GPL version 3 or later, see [Docker image](#docker-image).

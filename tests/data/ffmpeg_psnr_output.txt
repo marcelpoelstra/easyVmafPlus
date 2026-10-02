@@ -1,0 +1,20 @@
+Input #0, lavfi, from 'testsrc2=s=640x480:r=25:d=0.2':
+  Duration: N/A, start: 0.000000, bitrate: N/A
+  Stream #0:0: Video: wrapped_avframe, yuv420p, 640x480 [SAR 1:1 DAR 4:3], 25 fps, 25 tbr, 25 tbn
+Input #1, lavfi, from 'testsrc2=s=640x480:r=25:d=0.2':
+  Duration: N/A, start: 0.000000, bitrate: N/A
+  Stream #1:0: Video: wrapped_avframe, yuv420p, 640x480 [SAR 1:1 DAR 4:3], 25 fps, 25 tbr, 25 tbn
+Stream mapping:
+  Stream #0:0 (wrapped_avframe) -> boxblur:default
+  Stream #1:0 (wrapped_avframe) -> psnr
+  psnr:default -> Stream #0:0 (wrapped_avframe)
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf63.1.102
+  Stream #0:0: Video: wrapped_avframe, yuv420p(progressive), 640x480 [SAR 1:1 DAR 4:3], q=2-31, 200 kb/s, 25 fps, 25 tbn
+    Metadata:
+      encoder         : Lavc63.1.102 wrapped_avframe
+[Parsed_psnr_1 @ 0x75e0c29380] PSNR y:29.794730 u:27.095862 v:23.559389 average:27.548382 min:27.453691 max:27.647649
+[out#0/null @ 0x75e0c289c0] video:2KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    5 fps=0.0 q=-0.0 Lsize=N/A time=00:00:00.20 bitrate=N/A speed=  31x elapsed=0:00:00.00    

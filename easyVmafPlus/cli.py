@@ -34,7 +34,7 @@ import xml.etree.ElementTree as ET
 from signal import signal, SIGINT
 from statistics import mean
 
-from .FFmpeg import check_ffmpeg, HD_MODEL_NAME, HD_NEG_MODEL_NAME, HD_PHONE_MODEL_NAME, _4K_MODEL_NAME
+from .FFmpeg import check_ffmpeg
 from .Vmaf import vmaf, UnsupportedFramerateError
 
 logger = logging.getLogger(__name__)
@@ -75,12 +75,8 @@ def _build_result(distorted, reference, offset, psnr, model,
     return result
 
 
-def _read_scores(vmafpath, output_fmt, model):
-    """Per-frame scores from the VMAF log, per model name"""
-    if model == 'HD':
-        names = [HD_MODEL_NAME, HD_NEG_MODEL_NAME, HD_PHONE_MODEL_NAME]
-    else:
-        names = [_4K_MODEL_NAME]
+def _read_scores(vmafpath, output_fmt, names):
+    """Per-frame scores from the VMAF log, per score name"""
     scores = {name: [] for name in names}
 
     if output_fmt == 'csv':
@@ -127,6 +123,10 @@ def get_args():
     parser.add_argument('-reverse', help="If enable, it Changes the default Autosync behaviour: The first frames of the Reference video are used as reference to sync with the Distorted one. (Default = Disable).", action='store_true')
     parser.add_argument('-model', dest='model', type=str, default="HD",
                         help="Vmaf Model. Options: HD, 4K. (Default: HD).")
+    parser.add_argument(
+        '-vmaf_v0', help='Use the VMAF v0.6.1 models instead of the VMAF v1 models. (Default: false).', action='store_true')
+    parser.add_argument(
+        '-disable_hfr', help='Do not use the VMAF v1 HFR models, which are picked at a compared frame rate of 50 fps or higher. (Default: false).', action='store_true')
     parser.add_argument('-threads', dest='threads', type=int,
                         default=0, help='number of threads, also the number of parallel sync passes (default=0, one per CPU core)')
     parser.add_argument(
@@ -186,6 +186,8 @@ def main():
     cambi_heatmap = cmdParser.cambi_heatmap
     sync_only = cmdParser.sync_only
     use_json = cmdParser.json
+    vmaf_v0 = cmdParser.vmaf_v0
+    disable_hfr = cmdParser.disable_hfr
 
     # Setting verbosity
     if verbose:
@@ -207,13 +209,19 @@ def main():
         _exit_with_error(e)
     version = ffmpeg_info['version_str']
     if not ffmpeg_info['meets_minimum']:
-        _exit_with_error(f"FFmpeg {version} detected. easyVmafPlus requires FFmpeg >= 5.0 built with --enable-libvmaf.")
+        _exit_with_error(f"FFmpeg {version} detected. easyVmafPlus requires FFmpeg >= 9.0 built with --enable-libvmaf.")
     if not ffmpeg_info['libvmaf']:
         _exit_with_error(f"FFmpeg {version} has no libvmaf filter. Build FFmpeg with --enable-libvmaf.")
-    if not ffmpeg_info['builtin_models']:
-        _exit_with_error(f"FFmpeg {version} is installed but libvmaf built-in models are not available. "
-                         f"Rebuild libvmaf with '-Dbuilt_in_models=true' and recompile FFmpeg.")
-    logger.info("FFmpeg %s detected. Built-in models: available.", version)
+    if vmaf_v0:
+        if not ffmpeg_info['builtin_models']:
+            _exit_with_error(f"FFmpeg {version} is installed but libvmaf built-in models are not available. "
+                             f"Rebuild libvmaf with '-Dbuilt_in_models=true' and recompile FFmpeg.")
+        logger.info("FFmpeg %s detected. Built-in models: available.", version)
+    else:
+        if not ffmpeg_info['v1_models']:
+            _exit_with_error(f"FFmpeg {version} cannot run the VMAF v1 models. easyVmafPlus needs libvmaf 3.2.1 or later. "
+                             f"The v0.6.1 models run with -vmaf_v0.")
+        logger.info("FFmpeg %s detected. VMAF v1 models: available.", version)
 
     # check output format
     if output_fmt not in ["json", "xml", "csv"]:
@@ -237,7 +245,8 @@ def main():
         try:
             myVmaf = vmaf(distorted, reference, loglevel=loglevel, subsample=n_subsample, model=model,
                           output_fmt=output_fmt, threads=threads, print_progress=print_progress,
-                          end_sync=end_sync, manual_fps=fps, cambi_heatmap=cambi_heatmap)
+                          end_sync=end_sync, manual_fps=fps, cambi_heatmap=cambi_heatmap,
+                          vmaf_v0=vmaf_v0, disable_hfr=disable_hfr)
             '''check if syncWin was set. If true offset is computed automatically, otherwise manual values are used  '''
             if syncWin > 0:
                 offset, psnr = myVmaf.syncOffset(syncWin, ss, reverse)
@@ -257,7 +266,8 @@ def main():
 
             myVmaf.getVmaf()
             vmafpath = myVmaf.ffmpegQos.vmafpath
-            scores = {name: mean(values) for name, values in _read_scores(vmafpath, output_fmt, model).items()}
+            names = [vmaf_model.name for vmaf_model in myVmaf.models]
+            scores = {name: mean(values) for name, values in _read_scores(vmafpath, output_fmt, names).items()}
         except (UnsupportedFramerateError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
             _exit_with_error(e)
 
@@ -274,12 +284,8 @@ def main():
             print("VMAF computed", flush=True)
             print("=======================================", flush=True)
             print("offset: ", offset, " | psnr: ", psnr)
-            if model == 'HD':
-                print("VMAF HD: ", scores[HD_MODEL_NAME])
-                print("VMAF Neg: ", scores[HD_NEG_MODEL_NAME])
-                print("VMAF Phone: ", scores[HD_PHONE_MODEL_NAME])
-            if model == '4K':
-                print("VMAF 4K: ", scores[_4K_MODEL_NAME])
+            for vmaf_model in myVmaf.models:
+                print(f"{vmaf_model.label}: ", scores[vmaf_model.name])
             print("VMAF output file path: ", vmafpath)
             if cambi_path:
                 print("CAMBI Heatmap output path: ", cambi_path)

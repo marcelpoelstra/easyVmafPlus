@@ -1,0 +1,26 @@
+{
+    "format": {
+        "filename": "progressive.mkv",
+        "nb_streams": 1,
+        "nb_programs": 0,
+        "nb_stream_groups": 0,
+        "format_name": "matroska,webm",
+        "format_long_name": "Matroska / WebM",
+        "start_time": "0.000000",
+        "duration": "2.066000",
+        "size": "2077947",
+        "bit_rate": "8046261",
+        "probe_score": 100,
+        "tags": {
+            "title": "Big Buck Bunny, Sunflower version",
+            "COMMENT": "Creative Commons Attribution 3.0 - http://bbb3d.renderfarming.net",
+            "MAJOR_BRAND": "isom",
+            "MINOR_VERSION": "512",
+            "COMPATIBLE_BRANDS": "isomiso2avc1mp41",
+            "ARTIST": "Blender Foundation 2008, Janus Bager Kristensen 2013",
+            "COMPOSER": "Sacha Goedegebure",
+            "GENRE": "Animation",
+            "ENCODER": "Lavf63.1.102"
+        }
+    }
+}

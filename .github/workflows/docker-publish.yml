@@ -18,6 +18,9 @@ jobs:
       id-token: write
       packages: write
     with:
+      runner: |
+        default=ubuntu-26.04
+        linux/arm64=ubuntu-26.04-arm
       output: image
       push: true
       platforms: linux/amd64,linux/arm64
