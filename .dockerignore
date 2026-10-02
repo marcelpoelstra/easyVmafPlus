@@ -1,0 +1,18 @@
+# Not used by the image
+.git/
+.github/
+.venv/
+workdocuments/
+tests/
+readme/
+
+# Local build and run output
+**/__pycache__/
+*.egg-info/
+build/
+dist/
+*.log
+
+# VMAF output of local runs next to the samples
+video_samples/*_vmaf.*
+video_samples/*_cambi_heatmap*

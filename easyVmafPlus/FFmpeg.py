@@ -23,40 +23,49 @@ SOFTWARE.
 """
 
 
-import config
+from . import config
+import re
 import subprocess
 import json
+import logging
 import os
-import shlex
 from ffmpeg_progress_yield import FfmpegProgress
 
-
-HD_MODEL_VERSION = 'vmaf_v0.6.1'
-HD_MODEL_NAME= 'vmaf_hd'
-HD_NEG_MODEL_VERSION = 'vmaf_v0.6.1neg'
-HD_NEG_MODEL_NAME = 'vmaf_hd_neg'
-HD_PHONE_MODEL_VERSION = 'vmaf_v0.6.1'
-HD_PHONE_MODEL_NAME = 'vmaf_hd_phone'
-
-_4K_MODEL_VERSION = 'vmaf_4k_v0.6.1'
-_4K_MODEL_NAME = 'vmaf_4k'
+logger = logging.getLogger(__name__)
 
 
+# Each model: (libvmaf model version, score name in the VMAF log, extra model parameters)
+VMAF_MODELS = {
+    'HD': [
+        ('vmaf_v0.6.1', 'vmaf_hd', {}),
+        ('vmaf_v0.6.1neg', 'vmaf_hd_neg', {}),
+        ('vmaf_v0.6.1', 'vmaf_hd_phone', {'enable_transform': 'true'}),
+    ],
+    '4K': [
+        ('vmaf_4k_v0.6.1', 'vmaf_4k', {}),
+    ],
+}
+
+HD_MODEL_NAME = VMAF_MODELS['HD'][0][1]
+HD_NEG_MODEL_NAME = VMAF_MODELS['HD'][1][1]
+HD_PHONE_MODEL_NAME = VMAF_MODELS['HD'][2][1]
+_4K_MODEL_NAME = VMAF_MODELS['4K'][0][1]
 
 
 class FFprobe:
     '''
-    Class to interact with FFprobe. 
+    Class to interact with FFprobe.
     It gets info about stream, frames and mpeg packets
 
     Inputs:
         - videoSrc: path to video
-    Outputs: 
+    Outputs:
         - getStreamInfo()
         - getFramesInfo()
         - getPacketsInfo()
+        - getFormatInfo()
     '''
-    cmd = os.environ.get('FFPROBE', config.ffprobe)
+    _executable = os.environ.get('FFPROBE', config.ffprobe)
 
     def __init__(self, videoSrc, loglevel="info"):
         self.videoSrc = videoSrc
@@ -64,16 +73,29 @@ class FFprobe:
         self.streamInfo = None
         self.framesInfo = None
         self.packetsInfo = None
+        self.formatInfo = None
+        self._cmd = None
 
     ''' private methods '''
 
+    def _commitBase(self):
+        ffprobe_loglevel = self.loglevel if self.loglevel == "verbose" else "quiet"
+        return [FFprobe._executable, '-hide_banner', '-loglevel', ffprobe_loglevel,
+                '-print_format', 'json']
+
+    def _commitStreamSelection(self):
+        return ['-select_streams', 'v']
+
+    def _commitInput(self):
+        return ['-i', self.videoSrc, '-read_intervals', '%+5']
+
     def _commit(self, opt):
-        self.cmd = f'{FFprobe.cmd} -hide_banner -loglevel {self.loglevel} -print_format json {opt} -select_streams v -i \"{self.videoSrc}\" -read_intervals %+5'
+        self._cmd = (self._commitBase() + [opt] +
+                     self._commitStreamSelection() + self._commitInput())
 
     def _run(self):
-        if self.loglevel == "verbose":
-            print(self.cmd, flush=True)
-        return json.loads(subprocess.check_output(self.cmd, shell=True))
+        logger.debug("FFprobe cmd: %s", self._cmd)
+        return json.loads(subprocess.check_output(self._cmd, shell=False))
 
     ''' public methods '''
 
@@ -94,20 +116,20 @@ class FFprobe:
 
     def getFormatInfo(self):
         self._commit('-show_format')
-        self.packetsInfo = self._run()['format']
-        return self.packetsInfo
+        self.formatInfo = self._run()['format']
+        return self.formatInfo
 
 
 class FFmpegQos:
     '''
-    Class to interact with FFmpeg QoS Filters: PSNR and VMAF. 
+    Class to interact with FFmpeg QoS Filters: PSNR and VMAF.
     Particullary, it interacts with libvmaf library through lavfi filter
     '''
-    cmd = os.environ.get('FFMPEG', config.ffmpeg)
+    _executable = os.environ.get('FFMPEG', config.ffmpeg)
 
     def __init__(self,  main, ref, loglevel="info"):
         self.loglevel = loglevel
-        self.cmd = None
+        self._cmd = None
         self.main = inputFFmpeg(main, input_id=0)
         self.ref = inputFFmpeg(ref, input_id=1)
         self.psnrFilter = []
@@ -116,108 +138,112 @@ class FFmpegQos:
         self.vmafpath = None
         self.vmaf_cambi_heatmap_path = None
 
+    @staticmethod
+    def _escape_filter_value(value, option_levels=1):
+        '''
+        Escape a value for an FFmpeg filter option, e.g. libvmaf=log_path=VALUE.
+        Level 1 escapes the filter option characters, level 2 the filtergraph
+        characters: https://ffmpeg.org/ffmpeg-filters.html#Notes-on-filtergraph-escaping
+        A value inside the libvmaf feature= option, e.g. heatmaps_path, passes one
+        more option parser (av_dict_parse_string in vf_libvmaf.c): option_levels=2.
+        '''
+        for chars in ("\\':",) * option_levels + ("\\'[],;",):
+            for c in chars:
+                value = value.replace(c, '\\' + c)
+        return value
+
+    def _commitBase(self):
+        return [FFmpegQos._executable, '-y', '-hide_banner', '-stats', '-loglevel', self.loglevel]
+
     def _commit(self):
         """build the final cmd to run"""
-        baseCmd = f'{FFmpegQos.cmd} -y -hide_banner -stats -loglevel {self.loglevel}'
-        inputsCmd = self._commitInputs()
-        filterCmd = self._commitFilters()
-        outputCmd = self._commitOutputs()
-        self.cmd = f'{baseCmd} {inputsCmd} {filterCmd} {outputCmd}'
+        self._cmd = (self._commitBase() + self._commitInputs() +
+                     self._commitFilters() + self._commitOutputs())
 
     def _commitInputs(self):
-        """build the cmd for the inputs files"""
-        inputCmd = f'-hwaccel auto -i \"{self.main.videoSrc}\" -hwaccel auto -i \"{self.ref.videoSrc}\" -map 0:v -map 1:v'
-        return inputCmd
+        """build the cmd for the inputs files, with hardware accelerated decoding for each input"""
+        return ['-hwaccel', 'auto', '-i', self.main.videoSrc,
+                '-hwaccel', 'auto', '-i', self.ref.videoSrc,
+                '-map', '0:v', '-map', '1:v']
 
     def _commitOutputs(self):
-        return "-f null -"
+        return ['-f', 'null', '-']
 
     def _commitFilters(self, filterName='lavfi'):
         """build the cmd for the filters"""
-        filterCmd = f'-{filterName} \'{";".join(self.main.filtersList + self.ref.filtersList + self.psnrFilter + self.vmafFilter)}\''
-        return filterCmd
+        filters = self.main.filtersList + self.ref.filtersList + self.psnrFilter + self.vmafFilter
+        return [f'-{filterName}', ';'.join(filters)]
 
-    def getPsnr(self, stats_file=False):
-        """ 
-        It adds PSNR filter to lavfi chain and run the ffmpeg cmd.
-        The output is returned and saved as stats_file_psnr.log
+    @staticmethod
+    def _build_model_string(model):
+        """
+        The libvmaf model= value: per model its version, name and extra
+        parameters joined by escaped colons, the models joined by |.
+        """
+        if model not in VMAF_MODELS:
+            raise ValueError(f"Invalid VMAF model: {model!r}. Supported: {', '.join(VMAF_MODELS)}")
+        entries = []
+        for version, name, params in VMAF_MODELS[model]:
+            tokens = [f'version={version}', f'name={name}'] + [f'{k}={v}' for k, v in params.items()]
+            entries.append('\\\\:'.join(tokens))
+        return '|'.join(entries)
+
+    def getPsnr(self):
+        """
+        It adds the PSNR filter to the lavfi chain, runs the ffmpeg cmd and
+        returns the average PSNR from the ffmpeg output.
         """
         main = self.main.lastOutputID
         ref = self.ref.lastOutputID
-        if stats_file == True:
-            stats_file = os.path.splitext(self.main.videoSrc)[0] + '_psnr.log'
-        else:
-            stats_file = 'stats_file_psnr.log'
-
-        self.psnrFilter = [f'[{main}][{ref}]psnr=stats_file={stats_file}']
+        self.psnrFilter = [f'[{main}][{ref}]psnr']
         self._commit()
 
-        if self.loglevel == "verbose":
-            print(self.cmd, flush=True)
-        stdout = (subprocess.check_output(
-            self.cmd, stderr=subprocess.STDOUT, shell=True)).decode('utf-8')
+        logger.debug("FFmpeg PSNR cmd: %s", self._cmd)
+        stdout = subprocess.check_output(
+            self._cmd, stderr=subprocess.STDOUT, shell=False).decode('utf-8')
         stdout = stdout.split(" ")
         psnr = [s for s in stdout if "average" in s][0].split(":")[1]
         return float(psnr)
 
-    def getVmaf(self, log_path=None, model='HD', subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features = None, cambi_heatmap = False):
-        main = self.main.lastOutputID
-        ref = self.ref.lastOutputID
-        if output_fmt == 'xml':
-            log_fmt = "xml"
-            if log_path == None:
-                log_path = os.path.splitext(self.main.videoSrc)[
-                    0] + '_vmaf.xml'
-        else:
-            log_fmt = "json"
-            if log_path == None:
-                log_path = os.path.splitext(self.main.videoSrc)[
-                    0] + '_vmaf.json'
+    def getVmaf(self, log_path=None, model='HD', subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features=None, cambi_heatmap=False):
+        log_fmt = output_fmt if output_fmt in ('xml', 'csv') else 'json'
+        if log_path is None:
+            log_path = os.path.splitext(self.main.videoSrc)[0] + f'_vmaf.{log_fmt}'
         self.vmafpath = log_path
-
         self.vmaf_cambi_heatmap_path = os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap'
 
-
-
-        if model == 'HD':
-            model_hd = f'version={HD_MODEL_VERSION}\\\\:name={HD_MODEL_NAME}|version={HD_NEG_MODEL_VERSION}\\\\:name={HD_NEG_MODEL_NAME}|version={HD_PHONE_MODEL_VERSION}\\\\:name={HD_PHONE_MODEL_NAME}\\\\:enable_transform=true'
-            model = model_hd
-        elif model == '4K':
-            model_4k = f'version={_4K_MODEL_VERSION}\\\\:name={_4K_MODEL_NAME}'
-            model = model_4k
         if threads == 0:
             threads = os.cpu_count()
-        if end_sync:
-            shortest = 1
-        else:
-            shortest = 0
+        shortest = 1 if end_sync else 0
 
-        if not features:
-            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}']
-        
-        elif features and not cambi_heatmap:
-            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}:feature={features}']
-
-        elif features and cambi_heatmap:
-            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}:feature={features}\\\\:heatmaps_path={self.vmaf_cambi_heatmap_path}']
-
+        params = (f'log_fmt={log_fmt}'
+                  f':model={self._build_model_string(model)}'
+                  f':n_subsample={subsample}'
+                  f':log_path={self._escape_filter_value(log_path)}'
+                  f':n_threads={threads}'
+                  f':shortest={shortest}')
+        if features:
+            params += f':feature={features}'
+            if cambi_heatmap:
+                params += f'\\\\:heatmaps_path={self._escape_filter_value(self.vmaf_cambi_heatmap_path, option_levels=2)}'
+        main = self.main.lastOutputID
+        ref = self.ref.lastOutputID
+        self.vmafFilter = [f'[{main}][{ref}]libvmaf={params}']
 
         self._commit()
-        if self.loglevel == "verbose":
-            print(self.cmd, flush=True)
+        logger.debug("FFmpeg VMAF cmd: %s", self._cmd)
 
         if print_progress:
-            cmd_progress = shlex.split(self.cmd)
-            process = FfmpegProgress(cmd_progress)
+            process = FfmpegProgress(self._cmd)
+            # run_command_with_progress raises RuntimeError when ffmpeg exits with an error
             for progress in process.run_command_with_progress():
-                print(f"progress = {progress}% - ",
-                      "\n".join(str(process.stderr).splitlines()[-9:-8]),
-                      flush=True)
-
+                logger.info("progress = %s%% - %s", progress,
+                            "\n".join(str(process.stderr).splitlines()[-9:-8]))
         else:
-            process = subprocess.Popen(
-                self.cmd, stdout=subprocess.PIPE, shell=True)
+            process = subprocess.Popen(self._cmd, stdout=subprocess.PIPE, shell=False)
             process.communicate()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, self._cmd)
 
         return process
 
@@ -225,17 +251,10 @@ class FFmpegQos:
         self.psnrFilter = []
         self.vmafFilter = []
 
-    def invertSrcs(self):
-        temp1 = self.main.videoSrc
-        temp2 = self.ref.videoSrc
-        invertedSrc = self.invertedSrc
-        self.__init__(temp2, temp1, self.loglevel)
-        self.invertedSrc = not (invertedSrc)
-
 
 class inputFFmpeg:
     '''
-    Class to interact with FFmpeg inputs. 
+    Class to interact with FFmpeg inputs.
     It allows to manage Filter chains to each input. i.e., main and ref. Each
     Supported Methods:
     - setScaleFilter()
@@ -321,3 +340,66 @@ class inputFFmpeg:
     def clearFilters(self):
         self.filtersList = []
         self.lastOutputID = f'{str(self.id)}:v'
+
+
+def check_ffmpeg():
+    """
+    Check the ffmpeg and ffprobe binaries before a run.
+
+    Returns a dict with:
+        'version_str':    'X.Y' from the ffmpeg version line, 'dev-build' when it has none
+        'meets_minimum':  True for FFmpeg 5.0 and later, and for dev builds
+        'libvmaf':        True when 'ffmpeg -filters' lists libvmaf
+        'builtin_models': False when libvmaf cannot load the built-in model vmaf_v0.6.1
+
+    Raises:
+        RuntimeError: when the ffmpeg or ffprobe binary is not found or cannot be run
+    """
+    if not FFmpegQos._executable:
+        raise RuntimeError("ffmpeg not found on PATH. Install FFmpeg >= 5.0 built with "
+                           "--enable-libvmaf, or point the FFMPEG environment variable to it.")
+    if not FFprobe._executable:
+        raise RuntimeError("ffprobe not found on PATH. Install FFmpeg >= 5.0, "
+                           "or point the FFPROBE environment variable to it.")
+    result = {
+        'version_str': 'unknown',
+        'meets_minimum': False,
+        'libvmaf': False,
+        'builtin_models': False,
+    }
+
+    try:
+        version_output = subprocess.run([FFmpegQos._executable, '-version'],
+                                        capture_output=True, text=True).stdout
+        subprocess.run([FFprobe._executable, '-version'], capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"cannot run '{e.filename}': {e.strerror}") from None
+
+    # Release builds print "ffmpeg version 7.1" or "ffmpeg version 7.1.1",
+    # dev builds "ffmpeg version N-111825-gabcdef123"
+    match = re.search(r'ffmpeg version (\d+)\.(\d+)', version_output)
+    if match:
+        major, minor = int(match.group(1)), int(match.group(2))
+        result['version_str'] = f'{major}.{minor}'
+        result['meets_minimum'] = (major, minor) >= (5, 0)
+    else:
+        result['version_str'] = 'dev-build'
+        result['meets_minimum'] = True
+
+    filters_output = subprocess.run([FFmpegQos._executable, '-hide_banner', '-filters'],
+                                    capture_output=True, text=True).stdout
+    result['libvmaf'] = ' libvmaf ' in filters_output
+
+    # libvmaf reports "could not load libvmaf model" when the built-in model is
+    # missing; other errors of this probe run do not concern the models
+    probe_cmd = [
+        FFmpegQos._executable,
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'nullsrc=s=64x64:r=1:d=0.1',
+        '-f', 'lavfi', '-i', 'nullsrc=s=64x64:r=1:d=0.1',
+        '-lavfi', f'libvmaf=model=version=vmaf_v0.6.1:log_fmt=json:log_path={os.devnull}',
+        '-f', 'null', '-'
+    ]
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+    result['builtin_models'] = 'could not load libvmaf model' not in probe.stderr + probe.stdout
+    return result
