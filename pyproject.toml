@@ -7,8 +7,9 @@ name = "easyVmafPlus"
 version = "1.0.0"
 description = "FFmpeg-based VMAF computation with automatic deinterlacing, scaling and sync, and hardware accelerated decoding"
 readme = "README.md"
-license = "MIT"
-requires-python = ">=3.9"
+license = "MIT AND BSD-2-Clause-Patent"
+license-files = ["LICENSE", "easyVmafPlus/models/LICENSE"]
+requires-python = ">=3.11"
 dependencies = [
     "ffmpeg-progress-yield>=0.7.0",
 ]
@@ -23,6 +24,9 @@ easyVmafPlus = "easyVmafPlus.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["easyVmafPlus*"]
+
+[tool.setuptools.package-data]
+easyVmafPlus = ["models/LICENSE", "models/*/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

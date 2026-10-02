@@ -5,6 +5,7 @@
 workdocuments/
 tests/
 readme/
+**/.claude/
 
 # Local build and run output
 **/__pycache__/

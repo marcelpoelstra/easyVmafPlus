@@ -1,0 +1,43 @@
+{
+    "packets": [
+        {
+            "codec_type": "video",
+            "stream_index": 0,
+            "pts": 0,
+            "pts_time": "0.000000",
+            "dts": -1024,
+            "dts_time": "-0.066667",
+            "duration": 512,
+            "duration_time": "0.033333",
+            "size": "628899",
+            "pos": "48",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "video",
+            "stream_index": 0,
+            "pts": 2048,
+            "pts_time": "0.133333",
+            "dts": -512,
+            "dts_time": "-0.033333",
+            "duration": 512,
+            "duration_time": "0.033333",
+            "size": "64707",
+            "pos": "628947",
+            "flags": "___"
+        },
+        {
+            "codec_type": "video",
+            "stream_index": 0,
+            "pts": 1024,
+            "pts_time": "0.066667",
+            "dts": 0,
+            "dts_time": "0.000000",
+            "duration": 512,
+            "duration_time": "0.033333",
+            "size": "5619",
+            "pos": "693654",
+            "flags": "___"
+        }
+    ]
+}
