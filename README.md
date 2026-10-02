@@ -10,7 +10,7 @@ Details about how the original tool works can be found in [this OTTVerse article
 |---|---|
 | Hardware accelerated decoding | Every ffmpeg run passes `-hwaccel auto` to both the distorted and the reference input. When no hardware decoder is available, FFmpeg decodes in software. |
 | `easyVmafPlus` command | `easyVmafPlus.sh` starts the tool from any directory. `install_symlink.sh` and `uninstall_symlink.sh` add and remove an `easyVmafPlus` symlink on your `PATH`. |
-| Own Docker image | The Dockerfile builds FFmpeg and libvmaf from source and copies the code from this repository. The image is can be built for `linux/amd64` and `linux/arm64`. This repository offers ready built images under releases |
+| Own Docker image | The Dockerfile builds FFmpeg and libvmaf from source and copies the code from this repository. The image is can be built for `linux/amd64` and `linux/arm64`. This repository offers ready built images under "Packages" |
 
 
 ## Features from easyVmaf
