@@ -12,14 +12,6 @@ Details about how the original tool works can be found in [this OTTVerse article
 | `easyVmafPlus` command | `easyVmafPlus.sh` starts the tool from any directory. `install_symlink.sh` and `uninstall_symlink.sh` add and remove an `easyVmafPlus` symlink on your `PATH`. |
 | Own Docker image | The Dockerfile builds FFmpeg and libvmaf from source and copies the code from this repository. A GitHub Actions workflow publishes the image to the GitHub Container Registry for `linux/amd64` and `linux/arm64`. |
 
-### Fixes
-
-| Area | Fix |
-|---|---|
-| Relative paths | `easyVmafPlus.sh` runs the tool from the directory you call it in, so relative `-d` and `-r` paths work. |
-| Installer | `install_symlink.sh` stops with an error when no writable directory is found, instead of trying to create `/easyVmafPlus`. |
-| Uninstaller | `uninstall_symlink.sh` also searches the `PATH` directories the installer can fall back to. |
-| Docker build on `linux/amd64` | libvmaf is installed to `/usr/local/lib` on every platform, so the FFmpeg build finds it. Before, it landed in `/usr/local/lib64` on amd64 and FFmpeg's configure step failed. |
 
 ## Features from easyVmaf
 
