@@ -239,12 +239,15 @@ class TestDeinterlace:
         ('60000/1001', True, '30/1', False, [], [YADIF_FRAME, 'fps=fps=30.0']),
         ('30/1', True, '30/1', False, [], [YADIF_FRAME]),
         ('25/1', True, '50/1', False, [], [YADIF_FIELD]),
-        ('50/1', False, '25/1', True, [YADIF_FIELD, 'fps=fps=25.0'], []),
+        ('50/1', False, '25/1', True, [YADIF_FIELD], []),
+        ('60/1', False, '30000/1001', True, [YADIF_FIELD, 'fps=fps=60.0'], []),
         ('30/1', False, '30/1', True, [YADIF_FRAME], []),
+        ('30/1', False, '30000/1001', True, [YADIF_FRAME, 'fps=fps=30.0'], []),
         ('30/1', False, '60/1', True, [YADIF_FIELD], []),
     ], ids=["progressive-ref-lower", "progressive-main-lower", "progressive-equal", "progressive-29.97",
             "both-interlaced", "ref-interlaced-2x", "ref-interlaced-2x-59.94", "ref-interlaced-1x",
-            "ref-interlaced-half", "main-interlaced-2x", "main-interlaced-1x", "main-interlaced-half"])
+            "ref-interlaced-half", "main-interlaced-2x", "main-interlaced-2x-29.97", "main-interlaced-1x",
+            "main-interlaced-1x-29.97", "main-interlaced-half"])
     def test_rule(self, probes, ref_rate, ref_interlaced, main_rate, main_interlaced, main_filters, ref_filters):
         run = make_vmaf(probes, main=stream(r_frame_rate=main_rate), ref=stream(r_frame_rate=ref_rate),
                         main_frames=INTERLACED if main_interlaced else PROGRESSIVE,
@@ -255,9 +258,11 @@ class TestDeinterlace:
     @pytest.mark.parametrize("ref_rate, ref_interlaced, main_rate, main_interlaced, main_filters, ref_filters", [
         ('60/1', True, '30/1', False, [YADIF_FRAME], []),
         ('25/1', True, '50/1', False, [YADIF_FIELD], []),
+        ('50/1', False, '25/1', True, [], [YADIF_FIELD]),
         ('30/1', False, '30/1', True, [], [YADIF_FRAME]),
         ('30/1', False, '60/1', True, [], [YADIF_FIELD]),
-    ], ids=["ref-interlaced-2x", "ref-interlaced-half", "main-interlaced-1x", "main-interlaced-half"])
+    ], ids=["ref-interlaced-2x", "ref-interlaced-half", "main-interlaced-2x", "main-interlaced-1x",
+            "main-interlaced-half"])
     def test_inverted(self, probes, ref_rate, ref_interlaced, main_rate, main_interlaced, main_filters, ref_filters):
         run = make_vmaf(probes, main=stream(r_frame_rate=main_rate), ref=stream(r_frame_rate=ref_rate),
                         main_frames=INTERLACED if main_interlaced else PROGRESSIVE,

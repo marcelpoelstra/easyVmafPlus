@@ -228,22 +228,23 @@ class vmaf():
         self._applyScaleFilters(self.ffmpegQos)
         self._filters_applied = True
 
-    def _deinterlaceFrame(self, factor, stream):
+    def _deinterlaceFrame(self, factor, stream, fps):
+        """yadif frame mode on stream, then fps when REF is not exactly factor times MAIN"""
         ref_fps = getFrameRate(self.ref.streamInfo['r_frame_rate'])
         main_fps = getFrameRate(self.main.streamInfo['r_frame_rate'])
 
         stream.setDeintFrameFilter()
         if round(ref_fps, 2) != round(factor*main_fps, 2):
-            stream.setFpsFilter(round(main_fps, 5))
+            stream.setFpsFilter(round(fps, 5))
 
-    def _deinterlaceField(self, factor, stream):
-
+    def _deinterlaceField(self, factor, stream, fps):
+        """yadif field mode on stream, then fps when REF is not exactly factor times MAIN"""
         ref_fps = getFrameRate(self.ref.streamInfo['r_frame_rate'])
         main_fps = getFrameRate(self.main.streamInfo['r_frame_rate'])
 
         stream.setDeintFieldFilter()
         if round(ref_fps, 2) != round(factor*main_fps, 2):
-            stream.setFpsFilter(round(main_fps, 5))
+            stream.setFpsFilter(round(fps, 5))
 
     def _applyDeinterlaceFilters(self, qos):
         """
@@ -287,27 +288,27 @@ class vmaf():
                 # Examples: REF=60i, MAIN=30p
                 # REF=59.97i, MAIN=30p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(2, qos.ref)
+                    self._deinterlaceFrame(2, qos.ref, main_fps)
                 else:
-                    self._deinterlaceFrame(2, qos.main)
+                    self._deinterlaceFrame(2, qos.main, main_fps)
 
             elif round(ref_fps) == round(main_fps):
                 # Examples:
                 # REF=30i, MAIN=30p
                 # REF=29.97i, MAIN=30p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(1, qos.ref)
+                    self._deinterlaceFrame(1, qos.ref, main_fps)
                 else:
-                    self._deinterlaceFrame(1, qos.main)
+                    self._deinterlaceFrame(1, qos.main, main_fps)
 
             elif round(ref_fps) == round(main_fps/2):
                 # Examples:
                 # REF=30i, MAIN=60p
                 # REF=29.97i, MAIN=60p, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceField(0.5, qos.ref)
+                    self._deinterlaceField(0.5, qos.ref, main_fps)
                 else:
-                    self._deinterlaceField(0.5, qos.main)
+                    self._deinterlaceField(0.5, qos.main, main_fps)
 
             else:
                 raise UnsupportedFramerateError(unsupported)
@@ -319,29 +320,28 @@ class vmaf():
             if round(ref_fps) == round(main_fps*2):
                 # Examples: REF=60p, MAIN=30i
                 # REF=60p, MAIN=29.97i, etc
-                logger.warning("Frame rate conversion can produce bad vmaf scores")
                 if not qos.invertedSrc:
-                    self._deinterlaceField(1, qos.main)
+                    self._deinterlaceField(2, qos.main, ref_fps)
                 else:
-                    self._deinterlaceField(1, qos.ref)
+                    self._deinterlaceField(2, qos.ref, ref_fps)
 
             elif round(ref_fps) == round(main_fps):
                 # Examples:
                 # REF=30p, MAIN=30i
                 # REF=30p, MAIN=29.97i, etc
                 if not qos.invertedSrc:
-                    self._deinterlaceFrame(1, qos.main)
+                    self._deinterlaceFrame(1, qos.main, ref_fps)
                 else:
-                    self._deinterlaceFrame(1, qos.ref)
+                    self._deinterlaceFrame(1, qos.ref, ref_fps)
 
             elif round(ref_fps) == round(main_fps/2):
                 # Examples:
                 # REF=30p, MAIN=60i
                 logger.warning("Frame rate conversion can produce bad vmaf scores")
                 if not qos.invertedSrc:
-                    self._deinterlaceField(0.5, qos.main)
+                    self._deinterlaceField(0.5, qos.main, ref_fps)
                 else:
-                    self._deinterlaceField(0.5, qos.ref)
+                    self._deinterlaceField(0.5, qos.ref, ref_fps)
 
             else:
                 raise UnsupportedFramerateError(unsupported)
