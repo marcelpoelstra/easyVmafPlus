@@ -153,9 +153,23 @@ The v1 model files ship with easyVmafPlus in `easyVmafPlus/models/`, under the B
 | `<distorted name>_vmaf_plot.png` | The VMAF scores per frame, a curve per model, with lines for the 1%, 25%, 75% and 99% percentiles and the harmonic mean of the first model |
 | `<distorted name>_vmaf_histo.png` | The VMAF scores at the percentiles 1, 5, 25, 50, 75 and 99, a curve per model, with the mean and the harmonic mean in the legend |
 
+The plots and the low frame on this page come from the sync example [Distorted video delayed against the reference](#distorted-video-delayed-against-the-reference), with `-plot -low_frames` added:
+
+```bash
+easyVmafPlus -r BBB_sampleA_distorted.mp4 -d BBB_sampleB_distorted.mp4 -sw 2 -ss 0 -reverse -plot -low_frames
+```
+
+![VMAF scores per frame of BBB_sampleB_distorted.mp4](readme/BBB_sampleB_distorted_vmaf_plot.png)
+
+![VMAF scores of BBB_sampleB_distorted.mp4 at the percentiles](readme/BBB_sampleB_distorted_vmaf_histo.png)
+
 With two or more distorted files, `-plot` also writes both plots over all files, next to the reference: `<reference name>_vmaf_combined_plot.png` and `<reference name>_vmaf_combined_histo.png`. The y-axis runs from 0 to 100, or to 110 on plots with `vmaf_v1_4k_3h`.
 
 `-low_frames` exports every frame whose score of the first model (`vmaf_v1_hd`, `vmaf_v1_4k`, `vmaf_hd`, `vmaf_4k`, or its `_hfr` variant) lies below its 1st percentile. Each frame is an LZW TIFF file in `<distorted name>_vmaf_lowframes/`, at the resolution of the distorted video, with the file name, the score, the frame number and the time printed on it. Use it with care on long videos: it exports up to 1% of all frames.
+
+Frame 209 of the example, the lowest scoring of its three low frames, converted to PNG for this page:
+
+![Low frame 209 of BBB_sampleB_distorted.mp4 with the file name, score, frame number and time printed on it](readme/BBB_sampleB_distorted_vmaf_VMAF50_frame209.png)
 
 ### Plotting existing VMAF logs
 
@@ -177,6 +191,16 @@ options:
 ```
 
 `easyVmafPlusPlot BBB_sampleA_distorted_vmaf.json` writes `BBB_sampleA_distorted_vmaf_plot.png` and `BBB_sampleA_distorted_vmaf_histo.png`. With two or more logs it also writes the combined plots to the `-o` path.
+
+The combined plots of both sync examples, which use different references, from the logs in `video_samples/`:
+
+```bash
+easyVmafPlusPlot BBB_sampleA_distorted_vmaf.json BBB_sampleB_distorted_vmaf.json -o BBB_vmaf_combined.png
+```
+
+![Combined VMAF scores per frame of both sync examples](readme/BBB_vmaf_combined.png)
+
+![Combined VMAF scores of both sync examples at the percentiles](readme/BBB_vmaf_combined_histo.png)
 
 In the Docker image, give `-o` a path in the mounted folder. The default `plot.png` lands inside the container, which `--rm` deletes when the run ends:
 
