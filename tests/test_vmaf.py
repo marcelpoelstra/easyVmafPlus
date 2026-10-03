@@ -503,3 +503,56 @@ class TestGetVmaf:
         monkeypatch.setattr(run, 'syncOffset', lambda: synced.append(True))
         run.getVmaf(autoSync=True)
         assert synced == [True]
+
+
+class TestApplyOffsetFilters:
+    """vmaf._applyOffsetFilters: the trim filters of setOffset in any FFmpegQos."""
+
+    def test_given_qos(self, probes):
+        run = make_vmaf(probes, main=stream(duration='10.000000'), ref=stream(duration='12.000000'))
+        run.offset = -2.5
+        qos = FFmpegQos('main.mp4', 'ref.mp4')
+        run._applyOffsetFilters(qos)
+        assert filters(qos) == (chain(0, 'trim=start=2.5:duration=7.5, setpts=PTS-STARTPTS'),
+                                chain(1, 'trim=start=0:duration=7.5, setpts=PTS-STARTPTS'))
+        assert filters(run.ffmpegQos) == ([], [])
+
+
+@pytest.fixture
+def frames_run(monkeypatch):
+    """FFmpegQos.getFrames replaced by a fake returning `written`; returns the calls as (qos, frame numbers, folder)"""
+    def install(written):
+        calls = []
+
+        def getFrames(qos, frame_numbers, folder):
+            calls.append((qos, frame_numbers, folder))
+            return written
+        monkeypatch.setattr(FFmpegQos, 'getFrames', getFrames)
+        return calls
+    return install
+
+
+class TestGetFrames:
+    """vmaf.getFrames: the frames chain without scale and format filters, and the frame times."""
+
+    def test_chain_and_times(self, probes, frames_run):
+        calls = frames_run([(207, '/w/a.tif', 6.9), (209, '/w/b.tif', 6.966667)])
+        run = make_vmaf(probes, main=stream(width=1280, height=720, duration='10.000000'),
+                        ref=stream(duration='12.000000'))
+        run.offset = -1.0
+        assert run.getFrames([207, 209], '/w') == [(207, '/w/a.tif', pytest.approx(7.9)),
+                                                   (209, '/w/b.tif', pytest.approx(7.966667))]
+        qos, numbers, folder = calls[0]
+        assert (numbers, folder) == ([207, 209], '/w')
+        assert filters(qos) == (chain(0, 'fps=fps=30.0', 'trim=start=1.0:duration=9.0, setpts=PTS-STARTPTS'),
+                                chain(1, 'fps=fps=30.0', 'trim=start=0:duration=9.0, setpts=PTS-STARTPTS'))
+
+    def test_positive_offset_and_manual_fps(self, probes, frames_run):
+        calls = frames_run([(25, '/w/a.tif', 1.0)])
+        run = make_vmaf(probes, main=stream(duration='10.000000'), ref=stream(duration='12.000000'),
+                        manual_fps=25.0)
+        run.offset = 1.5
+        assert run.getFrames([25], '/w') == [(25, '/w/a.tif', 1.0)]
+        assert filters(calls[0][0]) == (
+            chain(0, 'fps=fps=25.0', 'trim=start=0:duration=10.0, setpts=PTS-STARTPTS'),
+            chain(1, 'fps=fps=25.0', 'trim=start=1.5:duration=10.0, setpts=PTS-STARTPTS'))

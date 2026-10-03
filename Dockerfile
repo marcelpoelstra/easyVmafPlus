@@ -126,5 +126,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY easyVmafPlus ./easyVmafPlus
 COPY video_samples ./video_samples
 RUN pip3 install --no-cache-dir . && rm -rf build easyVmafPlus.egg-info
+# Build the matplotlib font cache into the image, so a new container does not build it again
+RUN python3 -c "import matplotlib.font_manager"
 
 ENTRYPOINT [ "python3", "-u", "-m", "easyVmafPlus" ]

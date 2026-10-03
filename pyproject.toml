@@ -12,6 +12,9 @@ license-files = ["LICENSE", "easyVmafPlus/models/LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "ffmpeg-progress-yield>=0.7.0",
+    "matplotlib>=3.11",
+    "numpy>=2.4",
+    "pillow>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +24,7 @@ dev = [
 
 [project.scripts]
 easyVmafPlus = "easyVmafPlus.cli:main"
+easyVmafPlusPlot = "easyVmafPlus.plot:main"
 
 [tool.setuptools.packages.find]
 include = ["easyVmafPlus*"]

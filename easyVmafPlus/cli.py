@@ -23,18 +23,16 @@ SOFTWARE.
 """
 
 import argparse
-import csv
 import glob
 import json
 import logging
 import os.path
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from signal import signal, SIGINT
 from statistics import mean
 
-from .FFmpeg import check_ffmpeg
+from .FFmpeg import check_ffmpeg, read_vmaf_log
 from .Vmaf import vmaf, UnsupportedFramerateError
 
 logger = logging.getLogger(__name__)
@@ -51,7 +49,8 @@ def _exit_with_error(message):
 
 
 def _build_result(distorted, reference, offset, psnr, model,
-                  vmaf_scores=None, vmaf_output_file=None, cambi_heatmap_path=None):
+                  vmaf_scores=None, vmaf_output_file=None, cambi_heatmap_path=None,
+                  plot_path=None, histo_path=None, low_frames_path=None):
     """
     The -json result for one distorted file: paths, sync offset and PSNR,
     and after a VMAF run the mean score per model and the output paths.
@@ -71,29 +70,13 @@ def _build_result(distorted, reference, offset, psnr, model,
             vmaf_block['output_file'] = vmaf_output_file
         if cambi_heatmap_path:
             vmaf_block['cambi_heatmap_path'] = cambi_heatmap_path
+        if plot_path:
+            vmaf_block['plot_path'] = plot_path
+            vmaf_block['histo_path'] = histo_path
+        if low_frames_path:
+            vmaf_block['low_frames_path'] = low_frames_path
         result['vmaf'] = vmaf_block
     return result
-
-
-def _read_scores(vmafpath, output_fmt, names):
-    """Per-frame scores from the VMAF log, per score name"""
-    scores = {name: [] for name in names}
-
-    if output_fmt == 'csv':
-        with open(vmafpath, newline='') as csvFile:
-            for row in csv.DictReader(csvFile):
-                for name in names:
-                    scores[name].append(float(row[name]))
-    elif output_fmt == 'xml':
-        for frame in ET.parse(vmafpath).getroot().findall('frames/frame'):
-            for name in names:
-                scores[name].append(float(frame.attrib[name]))
-    else:
-        with open(vmafpath) as jsonFile:
-            for frame in json.load(jsonFile)['frames']:
-                for name in names:
-                    scores[name].append(frame["metrics"][name])
-    return scores
 
 
 def get_args():
@@ -142,6 +125,10 @@ def get_args():
     parser.add_argument(
         '-cambi_heatmap', help='Compute CAMBI and write the CAMBI heatmaps. (Default: false).', action='store_true')
     parser.add_argument(
+        '-plot', help='Write the temporal plot and the percentile plot of each distorted file, and combined plots over several distorted files. (Default: false).', action='store_true')
+    parser.add_argument(
+        '-low_frames', help='Export the frames below the 1st percentile of the main VMAF model as TIFF files. (Default: false).', action='store_true')
+    parser.add_argument(
         '-sync_only', action='store_true', default=False, help='For sync measurement only. No Vmaf processing. Requires -sw.')
     parser.add_argument(
         '-json', action='store_true', default=False,
@@ -188,6 +175,12 @@ def main():
     use_json = cmdParser.json
     vmaf_v0 = cmdParser.vmaf_v0
     disable_hfr = cmdParser.disable_hfr
+    write_plots = cmdParser.plot
+    low_frames = cmdParser.low_frames
+
+    if write_plots or low_frames:
+        # matplotlib loads only for runs that plot or export frames
+        from . import plot
 
     # Setting verbosity
     if verbose:
@@ -241,6 +234,7 @@ def main():
     if len(mainFiles) == 0:
         _exit_with_error(f"Distorted Video files not found with the given pattern/name: {main_pattern}")
 
+    logs = []
     for distorted in mainFiles:
         try:
             myVmaf = vmaf(distorted, reference, loglevel=loglevel, subsample=n_subsample, model=model,
@@ -267,15 +261,25 @@ def main():
             myVmaf.getVmaf()
             vmafpath = myVmaf.ffmpegQos.vmafpath
             names = [vmaf_model.name for vmaf_model in myVmaf.models]
-            scores = {name: mean(values) for name, values in _read_scores(vmafpath, output_fmt, names).items()}
-        except (UnsupportedFramerateError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
+            log = read_vmaf_log(vmafpath)
+            scores = {name: mean(log.scores[name]) for name in names}
+            plot_path = histo_path = low_frames_path = None
+            if write_plots:
+                log_base = os.path.splitext(vmafpath)[0]
+                plot_path = plot.save_figure(plot.plot_vmaf(log), log_base + '_plot.png')
+                histo_path = plot.save_figure(plot.plot_percentile_vmaf([log]), log_base + '_histo.png')
+                logs.append(log)
+            if low_frames:
+                low_frames_path = plot.export_tiff_frames(myVmaf, log)
+        except (UnsupportedFramerateError, ValueError, RuntimeError, subprocess.CalledProcessError, OSError) as e:
             _exit_with_error(e)
 
         cambi_path = myVmaf.ffmpegQos.vmaf_cambi_heatmap_path if cambi_heatmap else None
         if use_json:
             print(json.dumps(_build_result(distorted, reference, offset, psnr, model,
                                            vmaf_scores=scores, vmaf_output_file=vmafpath,
-                                           cambi_heatmap_path=cambi_path)), flush=True)
+                                           cambi_heatmap_path=cambi_path, plot_path=plot_path,
+                                           histo_path=histo_path, low_frames_path=low_frames_path)), flush=True)
         else:
             print("\n \n \n \n \n ")
             print("=======================================", flush=True)
@@ -289,7 +293,27 @@ def main():
             print("VMAF output file path: ", vmafpath)
             if cambi_path:
                 print("CAMBI Heatmap output path: ", cambi_path)
+            if plot_path:
+                print("Plot output path: ", plot_path)
+                print("Percentile plot output path: ", histo_path)
+            if low_frames_path:
+                print("Low frames output path: ", low_frames_path)
             print("\n \n \n \n \n ")
+
+    if len(logs) > 1:
+        reference_base = os.path.splitext(reference)[0]
+        try:
+            combined_path = plot.save_figure(plot.plot_multi_vmaf(logs), reference_base + '_vmaf_combined_plot.png')
+            combined_histo_path = plot.save_figure(plot.plot_percentile_vmaf(logs),
+                                                   reference_base + '_vmaf_combined_histo.png')
+        except (ValueError, OSError) as e:
+            _exit_with_error(e)
+        if use_json:
+            logger.info("Combined plot output path: %s", combined_path)
+            logger.info("Combined percentile plot output path: %s", combined_histo_path)
+        else:
+            print("Combined plot output path: ", combined_path)
+            print("Combined percentile plot output path: ", combined_histo_path, flush=True)
 
 
 if __name__ == '__main__':

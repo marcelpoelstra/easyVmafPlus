@@ -12,6 +12,7 @@ Details about how the original tool works can be found in [this OTTVerse article
 | VMAF v1 models | easyVmafPlus computes VMAF with the VMAF v1 models of libvmaf 3.2.1 by default, in their HFR variants at 50 frames per second or more. `-vmaf_v0` runs the v0.6.1 models, `-disable_hfr` the standard v1 models. See [VMAF models](#vmaf-models). |
 | More decoders in the Docker image | The image decodes JPEG XL with libjxl, AVS2 with libdavs2 and AVS3 with libuavs3d. FFmpeg 9.0 adds Animated WebP. |
 | `easyVmafPlus` command | easyVmafPlus is a Python package. `pipx install .` installs the `easyVmafPlus` command, which runs from any directory. |
+| VMAF plots and low frames | `-plot` writes a temporal plot and a percentile plot per distorted file, `-low_frames` exports the frames below the 1st percentile as TIFF files, and the `easyVmafPlusPlot` command plots existing VMAF logs. See [Plots and low frames](#plots-and-low-frames). |
 | Own Docker image | The Dockerfile builds FFmpeg and libvmaf from source and copies the code from this repository. The image is can be built for `linux/amd64` and `linux/arm64`. This repository offers ready built images under "Packages" |
 
 
@@ -36,7 +37,7 @@ easyVmafPlus includes the features of easyVmaf up to commit [cdcdd80](https://gi
 |---|---|
 | Linux or macOS | |
 | Python 3.11 or later | Verified with Python 3.12 (Docker image) and Python 3.14 (macOS) |
-| [pipx](https://pipx.pypa.io/) | Installs the `easyVmafPlus` command, together with the Python module [ffmpeg-progress-yield](https://github.com/slhck/ffmpeg-progress-yield) |
+| [pipx](https://pipx.pypa.io/) | Installs the `easyVmafPlus` and `easyVmafPlusPlot` commands, together with the Python modules [ffmpeg-progress-yield](https://github.com/slhck/ffmpeg-progress-yield), matplotlib, NumPy and Pillow |
 | FFmpeg 9.0 or later, built with libvmaf 3.2.1 or later | The VMAF v1 models need libvmaf 3.2.1 or later. |
 
 ## Installation
@@ -47,7 +48,7 @@ cd easyVmafPlus
 pipx install .
 ```
 
-pipx puts the `easyVmafPlus` command in `~/.local/bin`. If that directory is not on your `PATH`, run `pipx ensurepath` once.
+pipx puts the `easyVmafPlus` and `easyVmafPlusPlot` commands in `~/.local/bin`. If that directory is not on your `PATH`, run `pipx ensurepath` once.
 
 To remove the command again:
 
@@ -70,8 +71,8 @@ $ easyVmafPlus -h
 usage: easyVmafPlus [-h] -d D -r R [-sw SW] [-ss SS] [-fps FPS] [-subsample N]
                     [-reverse] [-model MODEL] [-vmaf_v0] [-disable_hfr]
                     [-threads THREADS] [-verbose] [-progress] [-endsync]
-                    [-output_fmt OUTPUT_FMT] [-cambi_heatmap] [-sync_only]
-                    [-json]
+                    [-output_fmt OUTPUT_FMT] [-cambi_heatmap] [-plot]
+                    [-low_frames] [-sync_only] [-json]
 
 Script to easy compute VMAF using FFmpeg. It allows to deinterlace, scale and sync Ref and Distorted video samples automatically:                         
 
@@ -102,6 +103,8 @@ options:
   -output_fmt OUTPUT_FMT
                         Output vmaf file format. Options: json, xml or csv (Default: json)
   -cambi_heatmap        Compute CAMBI and write the CAMBI heatmaps. (Default: false).
+  -plot                 Write the temporal plot and the percentile plot of each distorted file, and combined plots over several distorted files. (Default: false).
+  -low_frames           Export the frames below the 1st percentile of the main VMAF model as TIFF files. (Default: false).
   -sync_only            For sync measurement only. No Vmaf processing. Requires -sw.
   -json                 Print the results as JSON on stdout, one object per distorted file. Logs go to stderr. (Default: false).
 
@@ -117,7 +120,12 @@ required arguments:
 | File | Location |
 |---|---|
 | VMAF log, `<distorted name>_vmaf.json` (`_vmaf.xml` with `-output_fmt xml`, `_vmaf.csv` with `-output_fmt csv`) | Next to the distorted video |
-| CAMBI heatmap, `<distorted name>_cambi_heatmap` (with `-cambi_heatmap`) | Next to the distorted video |
+| CAMBI heatmaps, folder `<distorted name>_cambi_heatmap` (with `-cambi_heatmap`) | Next to the distorted video |
+| Plots `<distorted name>_vmaf_plot.png` and `<distorted name>_vmaf_histo.png` (with `-plot`) | Next to the distorted video |
+| Low frames, folder `<distorted name>_vmaf_lowframes` (with `-low_frames`) | Next to the distorted video |
+| Combined plots `<reference name>_vmaf_combined_plot.png` and `<reference name>_vmaf_combined_histo.png` (with `-plot` and two or more distorted files) | Next to the reference video |
+
+easyVmafPlus never replaces a file or folder. When a name is taken, `_2`, `_3` and so on is added: a second run writes `<distorted name>_vmaf_2.json`, and its plots and low frames take that name, such as `<distorted name>_vmaf_2_plot.png`.
 
 ## VMAF models
 
@@ -135,6 +143,46 @@ When the frames are compared at 50 frames per second or more, the v1 models run 
 A v1 run converts both inputs to 10 bits (`yuv420p10le`), as the libvmaf documentation recommends. It also passes the width, height and bit depth of the distorted video to the CAMBI feature of the v1 models.
 
 The v1 model files ship with easyVmafPlus in `easyVmafPlus/models/`, under the BSD+Patent licence of libvmaf: see [easyVmafPlus/models/LICENSE](easyVmafPlus/models/LICENSE).
+
+## Plots and low frames
+
+`-plot` writes two plots per distorted file, next to its VMAF log:
+
+| Plot | Content |
+|---|---|
+| `<distorted name>_vmaf_plot.png` | The VMAF scores per frame, a curve per model, with lines for the 1%, 25%, 75% and 99% percentiles and the harmonic mean of the first model |
+| `<distorted name>_vmaf_histo.png` | The VMAF scores at the percentiles 1, 5, 25, 50, 75 and 99, a curve per model, with the mean and the harmonic mean in the legend |
+
+With two or more distorted files, `-plot` also writes both plots over all files, next to the reference: `<reference name>_vmaf_combined_plot.png` and `<reference name>_vmaf_combined_histo.png`. The y-axis runs from 0 to 100, or to 110 on plots with `vmaf_v1_4k_3h`.
+
+`-low_frames` exports every frame whose score of the first model (`vmaf_v1_hd`, `vmaf_v1_4k`, `vmaf_hd`, `vmaf_4k`, or its `_hfr` variant) lies below its 1st percentile. Each frame is an LZW TIFF file in `<distorted name>_vmaf_lowframes/`, at the resolution of the distorted video, with the file name, the score, the frame number and the time printed on it. Use it with care on long videos: it exports up to 1% of all frames.
+
+### Plotting existing VMAF logs
+
+```console
+$ easyVmafPlusPlot -h
+usage: easyVmafPlusPlot [-h] [-o OUTPUT] vmaf_file [vmaf_file ...]
+
+Plot VMAF logs of easyVmafPlus: per log the temporal plot and the percentile
+plot, and with two or more logs the combined plots.
+
+positional arguments:
+  vmaf_file            VMAF log: json, xml or csv
+
+options:
+  -h, --help           show this help message and exit
+  -o, --output OUTPUT  Combined plot of two or more logs; the combined
+                       percentile plot gets _histo before the extension.
+                       (Default: plot.png).
+```
+
+`easyVmafPlusPlot BBB_sampleA_distorted_vmaf.json` writes `BBB_sampleA_distorted_vmaf_plot.png` and `BBB_sampleA_distorted_vmaf_histo.png`. With two or more logs it also writes the combined plots to the `-o` path.
+
+In the Docker image, give `-o` a path in the mounted folder. The default `plot.png` lands inside the container, which `--rm` deletes when the run ends:
+
+```bash
+docker run --rm --entrypoint easyVmafPlusPlot -v <local-path-to-your-video-files>:/<custom-name-folder> ghcr.io/marcelpoelstra/easyvmafplus /<custom-name-folder>/video-2_vmaf.json /<custom-name-folder>/video-3_vmaf.json -o /<custom-name-folder>/plot.png
+```
 
 ## Sync examples
 
@@ -209,7 +257,7 @@ FFmpeg in the image includes libdavs2, which is GPL, so the FFmpeg build is lice
 | `sha-<commit>` | Every push to `master`, with the short commit hash |
 | `<version>` | Every version tag `v*`, for example `v1.2.3` publishes `1.2.3` |
 
-To analyse your own files, mount the folder that holds them. The VMAF log is written next to the distorted video, so it ends up in the same folder.
+To analyse your own files, mount the folder that holds them. The VMAF log, the plots and the low frames are written next to the distorted video, so they end up in the same folder.
 
 ```bash
 docker run --rm -v <local-path-to-your-video-files>:/<custom-name-folder> ghcr.io/marcelpoelstra/easyvmafplus -r /<custom-name-folder>/video-1.mp4 -d /<custom-name-folder>/video-2.mp4

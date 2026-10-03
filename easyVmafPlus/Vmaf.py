@@ -494,28 +494,34 @@ class vmaf():
 
         return [self.offset, maxPsnr]
 
-    def setOffset(self, value=None):
+    def _applyOffsetFilters(self, qos):
         """
-        Apply Offset to trim Filter. Runs after the scale and frame rate filters.
+        Trim filters for self.offset in the given FFmpegQos. Runs after the scale and frame rate filters.
             If offset > 0: Ref delayed compared to  Main. Trimfilter cuts Ref
             if offset < 0: Main delayed compared to Ref. Trimfilter cuts Main
+        """
+        if self.offset > 0:
+            offset = self.offset
+            duration = min(self.main.duration, self.ref.duration-offset)
+            qos.ref.setTrimFilter(offset, duration)
+            qos.main.setTrimFilter(0, duration)
+
+        elif self.offset < 0:
+            offset = abs(self.offset)
+            duration = min(self.main.duration - offset, self.ref.duration)
+            qos.main.setTrimFilter(offset, duration)
+            qos.ref.setTrimFilter(0, duration)
+
+    def setOffset(self, value=None):
+        """
+        Apply Offset to trim Filter of self.ffmpegQos (see _applyOffsetFilters)
         """
 
         if value is not None:
             """ overrides the value in self.offset"""
             self.offset = value
 
-        if self.offset > 0:
-            offset = self.offset
-            duration = min(self.main.duration, self.ref.duration-offset)
-            self.ffmpegQos.ref.setTrimFilter(offset, duration)
-            self.ffmpegQos.main.setTrimFilter(0, duration)
-
-        elif self.offset < 0:
-            offset = abs(self.offset)
-            duration = min(self.main.duration - offset, self.ref.duration)
-            self.ffmpegQos.main.setTrimFilter(offset, duration)
-            self.ffmpegQos.ref.setTrimFilter(0, duration)
+        self._applyOffsetFilters(self.ffmpegQos)
 
     def _build_feature_string(self):
         """
@@ -595,6 +601,23 @@ class vmaf():
         vmafProcess = self.ffmpegQos.getVmaf(models=self.models, subsample=self.subsample,
                                              output_fmt=self.output_fmt, threads=self.threads, print_progress=self.print_progress, end_sync=self.end_sync, features=self.features, cambi_heatmap=self.cambi_heatmap)
         return vmafProcess
+
+    def getFrames(self, frame_numbers, folder):
+        """
+        Write the frames with the given frame numbers of the VMAF log as TIFF files into folder,
+        through the deinterlace, frame rate and trim filters of getVmaf without scale and format
+        filters, so the frames keep the resolution of the distorted input. Returns (frame number,
+        file, time in the distorted input in seconds) per written frame.
+        """
+        qos = FFmpegQos(self.main.videoSrc, self.ref.videoSrc, self.loglevel)
+        if self.manual_fps == 0:
+            self._applyDeinterlaceFilters(qos)
+        else:
+            qos.main.setFpsFilter(self.manual_fps)
+            qos.ref.setFpsFilter(self.manual_fps)
+        self._applyOffsetFilters(qos)
+        trim_start = abs(self.offset) if self.offset < 0 else 0
+        return [(number, path, trim_start + pts_time) for number, path, pts_time in qos.getFrames(frame_numbers, folder)]
 
 
 def getFrameRate(r_frame_rate):

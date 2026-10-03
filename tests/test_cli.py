@@ -1,6 +1,6 @@
-"""Tests for cli.py: the -json result, the reading of the VMAF log, the arguments, the startup check
-and the run per distorted file, with check_ffmpeg and vmaf replaced by fakes. tests/data/vmaf_v1_hd.*
-and tests/data/vmaf_v0_hd.json are logs of libvmaf 3.2.1 over five frames."""
+"""Tests for cli.py: the -json result, the arguments, the startup check and the run per distorted file,
+with check_ffmpeg and vmaf replaced by fakes. tests/data/vmaf_v1_hd.* and tests/data/vmaf_v0_hd.json
+are logs of libvmaf 3.2.1 over five frames."""
 
 import json
 import logging
@@ -12,9 +12,10 @@ from statistics import mean
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from easyVmafPlus import cli
-from easyVmafPlus.FFmpeg import select_models
+from easyVmafPlus.FFmpeg import create_unique_file, select_models
 from easyVmafPlus.Vmaf import UnsupportedFramerateError
 
 DATA = os.path.join(os.path.dirname(__file__), 'data')
@@ -53,27 +54,6 @@ class TestBuildResult:
         assert result['vmaf'] == {'model': 'HD', 'vmaf_hd': 90.0}
 
 
-class TestReadScores:
-    """cli._read_scores: the per-frame scores of the given names from a json, xml or csv log."""
-
-    @pytest.mark.parametrize("log_fmt", ['json', 'xml', 'csv'])
-    def test_v1_hd(self, log_fmt):
-        scores = cli._read_scores(os.path.join(DATA, f'vmaf_v1_hd.{log_fmt}'), log_fmt, list(V1_HD))
-        assert scores == {name: pytest.approx(values) for name, values in V1_HD.items()}
-
-    def test_v0_hd(self):
-        scores = cli._read_scores(os.path.join(DATA, 'vmaf_v0_hd.json'), 'json', list(V0_HD))
-        assert scores == {name: pytest.approx(values) for name, values in V0_HD.items()}
-
-    def test_selected_names(self):
-        scores = cli._read_scores(os.path.join(DATA, 'vmaf_v1_hd.csv'), 'csv', ['vmaf_v1_hd_phone'])
-        assert scores == {'vmaf_v1_hd_phone': pytest.approx(V1_HD['vmaf_v1_hd_phone'])}
-
-    def test_other_format_reads_json(self):
-        scores = cli._read_scores(os.path.join(DATA, 'vmaf_v1_hd.json'), 'txt', ['vmaf_v1_hd'])
-        assert scores == {'vmaf_v1_hd': pytest.approx(V1_HD['vmaf_v1_hd'])}
-
-
 class TestArguments:
     """cli.get_args and MyParser: flags, defaults and argument errors."""
 
@@ -86,17 +66,19 @@ class TestArguments:
         assert vars(self.parse(monkeypatch, '-d', 'd.mp4', '-r', 'r.mp4')) == {
             'd': 'd.mp4', 'r': 'r.mp4', 'sw': 0, 'ss': 0, 'fps': 0, 'n': 1, 'reverse': False, 'model': 'HD',
             'vmaf_v0': False, 'disable_hfr': False, 'threads': 0, 'verbose': False, 'progress': False,
-            'endsync': False, 'output_fmt': 'json', 'cambi_heatmap': False, 'sync_only': False, 'json': False}
+            'endsync': False, 'output_fmt': 'json', 'cambi_heatmap': False, 'plot': False, 'low_frames': False,
+            'sync_only': False, 'json': False}
 
     def test_values(self, monkeypatch):
         args = self.parse(monkeypatch, '-d', 'd*.mp4', '-r', 'r.mp4', '-sw', '2', '-ss', '1.5', '-fps', '25',
                           '-subsample', '3', '-reverse', '-model', '4K', '-vmaf_v0', '-disable_hfr', '-threads', '8',
-                          '-verbose', '-progress', '-endsync', '-output_fmt', 'xml', '-cambi_heatmap', '-sync_only',
-                          '-json')
+                          '-verbose', '-progress', '-endsync', '-output_fmt', 'xml', '-cambi_heatmap', '-plot',
+                          '-low_frames', '-sync_only', '-json')
         assert vars(args) == {
             'd': 'd*.mp4', 'r': 'r.mp4', 'sw': 2.0, 'ss': 1.5, 'fps': 25.0, 'n': 3, 'reverse': True, 'model': '4K',
             'vmaf_v0': True, 'disable_hfr': True, 'threads': 8, 'verbose': True, 'progress': True,
-            'endsync': True, 'output_fmt': 'xml', 'cambi_heatmap': True, 'sync_only': True, 'json': True}
+            'endsync': True, 'output_fmt': 'xml', 'cambi_heatmap': True, 'plot': True, 'low_frames': True,
+            'sync_only': True, 'json': True}
 
     @pytest.mark.parametrize("argv, message", [
         (['-d', 'd.mp4', '-r', 'r.mp4', '-sync_only'], 'error: -sync_only requires -sw greater than 0\n'),
@@ -142,9 +124,11 @@ def cli_run(monkeypatch, tmp_path, capsys):
         class FakeVmaf:
             def __init__(self, mainSrc, refSrc, **kwargs):
                 self.mainSrc, self.refSrc, self.kwargs = mainSrc, refSrc, kwargs
+                self.main = SimpleNamespace(videoSrc=mainSrc)
                 self.offset = 0
                 self.models = []
                 self.calls = []
+                self.frames = []
                 self.ffmpegQos = SimpleNamespace(vmafpath=None, vmaf_cambi_heatmap_path=None)
                 runs.append(self)
                 if init_error is not None:
@@ -163,9 +147,20 @@ def cli_run(monkeypatch, tmp_path, capsys):
                 generation = 'v0' if self.kwargs['vmaf_v0'] else 'v1'
                 self.models = select_models('HD', vmaf_v0=self.kwargs['vmaf_v0'])
                 base = os.path.splitext(self.mainSrc)[0]
-                self.ffmpegQos.vmafpath = f'{base}_vmaf.{log_fmt}'
+                # the VMAF log is reserved as FFmpegQos.getVmaf reserves it
+                log_file, self.ffmpegQos.vmafpath = create_unique_file(f'{base}_vmaf.{log_fmt}')
+                log_file.close()
                 self.ffmpegQos.vmaf_cambi_heatmap_path = f'{base}_cambi_heatmap'
                 shutil.copy(os.path.join(DATA, f'vmaf_{generation}_hd.{log_fmt}'), self.ffmpegQos.vmafpath)
+
+            def getFrames(self, frame_numbers, folder):
+                self.frames.append(list(frame_numbers))
+                written = []
+                for number in sorted(frame_numbers):
+                    path = os.path.join(folder, f'{number}.tif')
+                    Image.new('RGB', (64, 48), (255, 0, 0)).save(path, format='TIFF')
+                    written.append((number, path, number / 30))
+                return written
 
         def check_ffmpeg():
             if isinstance(check, Exception):
@@ -278,6 +273,63 @@ class TestMain:
         for label, name in (('VMAF HD', 'vmaf_hd'), ('VMAF Neg', 'vmaf_hd_neg'), ('VMAF Phone', 'vmaf_hd_phone')):
             assert f'{label}:  {means[name]}' in lines
 
+    def test_plots(self, cli_run):
+        result = cli_run.run('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, '-plot', '-json')
+        vmaf_block = json.loads(result.out)['vmaf']
+        assert (vmaf_block['plot_path'], vmaf_block['histo_path']) == (
+            str(cli_run.dir / 'dist_vmaf_plot.png'), str(cli_run.dir / 'dist_vmaf_histo.png'))
+        assert 'low_frames_path' not in vmaf_block
+        assert not (cli_run.dir / 'ref_vmaf_combined_plot.png').exists()
+
+    def test_plots_text_output(self, cli_run):
+        result = cli_run.run('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, '-plot')
+        lines = result.out.splitlines()
+        assert f"Plot output path:  {cli_run.dir / 'dist_vmaf_plot.png'}" in lines
+        assert f"Percentile plot output path:  {cli_run.dir / 'dist_vmaf_histo.png'}" in lines
+
+    def test_low_frames(self, cli_run):
+        result = cli_run.run('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, '-low_frames', '-json')
+        folder = cli_run.dir / 'dist_vmaf_lowframes'
+        assert json.loads(result.out)['vmaf']['low_frames_path'] == str(folder)
+        assert os.listdir(folder) == ['dist_vmaf_VMAF52_frame002.tif']
+        assert result.runs[0].frames == [[2]]
+
+    def test_low_frames_text_output(self, cli_run):
+        result = cli_run.run('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, '-low_frames')
+        assert f"Low frames output path:  {cli_run.dir / 'dist_vmaf_lowframes'}" in result.out.splitlines()
+
+    def test_combined_plots(self, cli_run, caplog):
+        with caplog.at_level(logging.INFO, logger='easyVmafPlus.cli'):
+            result = cli_run.run('-d', str(cli_run.dir / 'dist_*.mp4'), '-r', cli_run.reference, '-plot', '-json',
+                                 files=('dist_a.mp4', 'dist_b.mp4'))
+        assert len(result.out.splitlines()) == 2
+        for name in ('ref_vmaf_combined_plot.png', 'ref_vmaf_combined_histo.png'):
+            assert (cli_run.dir / name).exists()
+        assert f"Combined plot output path: {cli_run.dir / 'ref_vmaf_combined_plot.png'}" in caplog.messages
+
+    def test_combined_plots_text_output(self, cli_run):
+        result = cli_run.run('-d', str(cli_run.dir / 'dist_*.mp4'), '-r', cli_run.reference, '-plot',
+                             files=('dist_a.mp4', 'dist_b.mp4'))
+        lines = result.out.splitlines()
+        assert f"Combined plot output path:  {cli_run.dir / 'ref_vmaf_combined_plot.png'}" in lines
+        assert f"Combined percentile plot output path:  {cli_run.dir / 'ref_vmaf_combined_histo.png'}" in lines
+
+    def test_reference_among_distorted_files(self, cli_run):
+        cli_run.run('-d', str(cli_run.dir / '*.mp4'), '-r', cli_run.reference, '-plot')
+        assert {'ref_vmaf_plot.png', 'ref_vmaf_histo.png', 'ref_vmaf_combined_plot.png',
+                'ref_vmaf_combined_histo.png'} <= set(os.listdir(cli_run.dir))
+
+    def test_second_run_keeps_first(self, cli_run):
+        argv = ('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, '-plot', '-low_frames')
+        cli_run.run(*argv)
+        first = {name: (cli_run.dir / name).stat().st_mtime_ns
+                 for name in ('dist_vmaf.json', 'dist_vmaf_plot.png', 'dist_vmaf_histo.png')}
+        result = cli_run.run(*argv)
+        assert f"VMAF output file path:  {cli_run.dir / 'dist_vmaf_2.json'}" in result.out.splitlines()
+        for name in ('dist_vmaf_2_plot.png', 'dist_vmaf_2_histo.png', 'dist_vmaf_2_lowframes'):
+            assert (cli_run.dir / name).exists()
+        assert {name: (cli_run.dir / name).stat().st_mtime_ns for name in first} == first
+
     def test_every_matching_file(self, cli_run):
         result = cli_run.run('-d', str(cli_run.dir / 'dist_*.mp4'), '-r', cli_run.reference, '-json',
                              files=('dist_a.mp4', 'dist_b.mp4'))
@@ -351,7 +403,8 @@ class TestMain:
         {'init_error': ValueError("Invalid VMAF model: '8K'. Supported: HD, 4K")},
         {'run_error': RuntimeError('ffmpeg exited with an error')},
         {'run_error': subprocess.CalledProcessError(1, ['ffmpeg'])},
-    ], ids=["unsupported-framerate", "invalid-model", "progress-error", "ffmpeg-error"])
+        {'run_error': OSError('No space left on device')},
+    ], ids=["unsupported-framerate", "invalid-model", "progress-error", "ffmpeg-error", "os-error"])
     def test_run_error(self, cli_run, errors):
         result = cli_run.run('-d', str(cli_run.dir / 'dist.mp4'), '-r', cli_run.reference, **errors)
         error = next(iter(errors.values()))

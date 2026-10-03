@@ -25,12 +25,17 @@ SOFTWARE.
 
 from . import config
 from dataclasses import dataclass, field
+from statistics import mean
 from typing import Dict, List, Optional
+import csv
 import re
 import subprocess
 import json
 import logging
 import os
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from ffmpeg_progress_yield import FfmpegProgress
 
 logger = logging.getLogger(__name__)
@@ -105,6 +110,116 @@ def select_models(model, vmaf_v0=False, hfr=False):
         else:
             models.append(ModelConfig(name, label, path=v1_model_path(source), params=dict(params)))
     return models
+
+
+# A select expression of FFmpeg 9.0.2 takes at most 100 eq() terms (101 fail to parse):
+# up to 99 frames per branch of the frames pass, plus frame 0
+FRAMES_PER_SELECT = 99
+
+
+def create_unique_file(path):
+    """
+    Create path with exclusive creation, so an existing file is never replaced. When the name
+    exists, _2, _3 and so on goes before the extension. Returns the open binary file and its path.
+    """
+    stem, extension = os.path.splitext(path)
+    number = 1
+    while True:
+        candidate = path if number == 1 else f'{stem}_{number}{extension}'
+        try:
+            return open(candidate, 'xb'), candidate
+        except FileExistsError:
+            number += 1
+
+
+def create_unique_dir(path):
+    """
+    Create the folder path; when the name exists, _2, _3 and so on goes at its end.
+    Returns the path created.
+    """
+    number = 1
+    while True:
+        candidate = path if number == 1 else f'{path}_{number}'
+        try:
+            os.mkdir(candidate)
+            return candidate
+        except FileExistsError:
+            number += 1
+
+
+def known_scores():
+    """
+    The VMAF score names of VMAF_MODELS in their order, each v1 name followed by its HFR name, as
+    {score name: (label, score cap)}. The cap of a v1 model is the upper score_clip of its model
+    file; the v0 built-in models score up to 100.
+    """
+    scores = {}
+    for generation, model_sets in VMAF_MODELS.items():
+        for entries in model_sets.values():
+            for name, label, source, _ in entries:
+                if generation == 'v0':
+                    scores[name] = (label, 100.0)
+                    continue
+                for hfr in (False, True):
+                    with open(v1_model_path(source, hfr=hfr)) as model_file:
+                        cap = float(json.load(model_file)['model_dict']['score_clip'][1])
+                    scores[f'{name}_hfr' if hfr else name] = (f'{label} HFR' if hfr else label, cap)
+    return scores
+
+
+@dataclass
+class VmafLog:
+    """
+    The VMAF scores of a VMAF log: its path, the frame numbers, the per-frame scores per score
+    name, and per score name the mean and the harmonic mean.
+    """
+    path: str
+    frame_numbers: List[int]
+    scores: Dict[str, List[float]]
+    means: Dict[str, float]
+    harmonic_means: Dict[str, float]
+
+
+def read_vmaf_log(path):
+    """
+    The VMAF scores of a VMAF log in the format of its extension: json, xml or csv. The means come
+    from the pooled metrics of a json or xml log. A csv log has none, so they are computed, the
+    harmonic mean as libvmaf pools it: n / sum(1 / (x + 1)) - 1.
+    """
+    log_fmt = os.path.splitext(path)[1][1:]
+    if log_fmt not in ('json', 'xml', 'csv'):
+        raise ValueError(f"VMAF log {path}: unknown format {log_fmt!r}. Supported: json, xml, csv")
+    try:
+        if log_fmt == 'json':
+            with open(path) as log_file:
+                log = json.load(log_file)
+            frames = [(int(frame['frameNum']), frame['metrics']) for frame in log['frames']]
+            pooled = log.get('pooled_metrics', {})
+        elif log_fmt == 'xml':
+            root = ET.parse(path).getroot()
+            frames = [(int(frame.attrib['frameNum']), frame.attrib) for frame in root.findall('frames/frame')]
+            pooled = {metric.attrib['name']: metric.attrib for metric in root.findall('pooled_metrics/metric')}
+        else:
+            with open(path, newline='') as log_file:
+                frames = [(int(row['Frame']), row) for row in csv.DictReader(log_file)]
+            pooled = {}
+        if not frames:
+            raise ValueError(f"VMAF log {path} holds no frames")
+        names = [name for name in known_scores() if name in frames[0][1]]
+        if not names:
+            raise ValueError(f"VMAF log {path} holds no VMAF score of easyVmafPlus")
+        scores = {name: [float(metrics[name]) for _, metrics in frames] for name in names}
+        means, harmonic_means = {}, {}
+        for name, values in scores.items():
+            if name in pooled:
+                means[name] = float(pooled[name]['mean'])
+                harmonic_means[name] = float(pooled[name]['harmonic_mean'])
+            else:
+                means[name] = mean(values)
+                harmonic_means[name] = len(values) / sum(1 / (value + 1) for value in values) - 1
+    except (KeyError, TypeError, ET.ParseError) as error:
+        raise ValueError(f"VMAF log {path} cannot be read: {error!r}") from None
+    return VmafLog(path, [number for number, _ in frames], scores, means, harmonic_means)
 
 
 class FFprobe:
@@ -271,43 +386,116 @@ class FFmpegQos:
         log_fmt = output_fmt if output_fmt in ('xml', 'csv') else 'json'
         if log_path is None:
             log_path = os.path.splitext(self.main.videoSrc)[0] + f'_vmaf.{log_fmt}'
-        self.vmafpath = log_path
-        self.vmaf_cambi_heatmap_path = os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap'
-
         if threads == 0:
             threads = os.cpu_count()
         shortest = 1 if end_sync else 0
+        self.vmafpath = None
+        self.vmaf_cambi_heatmap_path = None
 
-        params = (f'log_fmt={log_fmt}'
-                  f':model={self._build_model_string(models)}'
-                  f':n_subsample={subsample}'
-                  f':log_path={self._escape_filter_value(log_path)}'
-                  f':n_threads={threads}'
-                  f':shortest={shortest}')
-        if features:
-            params += f':feature={features}'
-            if cambi_heatmap:
-                params += f'\\\\:heatmaps_path={self._escape_filter_value(self.vmaf_cambi_heatmap_path, option_levels=2)}'
-        main = self.main.lastOutputID
-        ref = self.ref.lastOutputID
-        self.vmafFilter = [f'[{main}][{ref}]libvmaf={params}']
+        try:
+            # No existing output is replaced: unique names are reserved, libvmaf writes into them
+            log_file, self.vmafpath = create_unique_file(log_path)
+            log_file.close()
+            if features and cambi_heatmap:
+                self.vmaf_cambi_heatmap_path = create_unique_dir(
+                    os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap')
 
-        self._commit()
-        logger.debug("FFmpeg VMAF cmd: %s", self._cmd)
+            params = (f'log_fmt={log_fmt}'
+                      f':model={self._build_model_string(models)}'
+                      f':n_subsample={subsample}'
+                      f':log_path={self._escape_filter_value(self.vmafpath)}'
+                      f':n_threads={threads}'
+                      f':shortest={shortest}')
+            if features:
+                params += f':feature={features}'
+                if cambi_heatmap:
+                    params += f'\\\\:heatmaps_path={self._escape_filter_value(self.vmaf_cambi_heatmap_path, option_levels=2)}'
+            main = self.main.lastOutputID
+            ref = self.ref.lastOutputID
+            self.vmafFilter = [f'[{main}][{ref}]libvmaf={params}']
 
-        if print_progress:
-            process = FfmpegProgress(self._cmd)
-            # run_command_with_progress raises RuntimeError when ffmpeg exits with an error
-            for progress in process.run_command_with_progress():
-                logger.info("progress = %s%% - %s", progress,
-                            "\n".join(str(process.stderr).splitlines()[-9:-8]))
-        else:
-            process = subprocess.Popen(self._cmd, stdout=subprocess.PIPE, shell=False)
-            process.communicate()
-            if process.returncode != 0:
-                raise subprocess.CalledProcessError(process.returncode, self._cmd)
+            self._commit()
+            logger.debug("FFmpeg VMAF cmd: %s", self._cmd)
+
+            if print_progress:
+                process = FfmpegProgress(self._cmd)
+                # run_command_with_progress raises RuntimeError when ffmpeg exits with an error
+                for progress in process.run_command_with_progress():
+                    logger.info("progress = %s%% - %s", progress,
+                                "\n".join(str(process.stderr).splitlines()[-9:-8]))
+            else:
+                process = subprocess.Popen(self._cmd, stdout=subprocess.PIPE, shell=False)
+                process.communicate()
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(process.returncode, self._cmd)
+        except BaseException:
+            self._removeEmptyOutputs()
+            raise
 
         return process
+
+    def _removeEmptyOutputs(self):
+        """The reserved VMAF log and heatmap folder of a failed or interrupted run go when still empty"""
+        if self.vmafpath and os.path.isfile(self.vmafpath) and os.path.getsize(self.vmafpath) == 0:
+            os.remove(self.vmafpath)
+        if self.vmaf_cambi_heatmap_path and os.path.isdir(self.vmaf_cambi_heatmap_path) \
+                and not os.listdir(self.vmaf_cambi_heatmap_path):
+            os.rmdir(self.vmaf_cambi_heatmap_path)
+
+    def getFrames(self, frame_numbers, folder):
+        """
+        Write the frames of the main chain with the given frame numbers as 8-bit RGB TIFF files into
+        folder, and return (frame number, file, pts_time) per written frame, in frame order.
+        A select expression takes at most 100 eq() terms (FFmpeg 9.0.2 rejects 101), so the chain
+        splits into branches of up to 99 frames, each with its own select and output. Every branch
+        also selects frame 0, because ffmpeg fails when an output receives no frame; those files
+        are not returned. A missing frame lies beyond the end of the main chain. The image2 muxer
+        reads each % of an output path as part of its pattern, so a % in folder is written as %%.
+        """
+        numbers = sorted(frame_numbers)
+        chunks = [numbers[start:start + FRAMES_PER_SELECT] for start in range(0, len(numbers), FRAMES_PER_SELECT)]
+        selections = [sorted({0, *chunk}) for chunk in chunks]
+        graph = self.main.filtersList + [
+            f'[{self.main.lastOutputID}]setpts=PTS-STARTPTS,split={len(chunks)}'
+            + ''.join(f'[select{branch}]' for branch in range(len(chunks)))]
+        outputs = []
+        for branch, selection in enumerate(selections):
+            select = '+'.join(f'eq(n\\,{number})' for number in selection)
+            graph.append(f'[select{branch}]select={select},showinfo@frames{branch}[frames{branch}]')
+            outputs += ['-map', f'[frames{branch}]', '-fps_mode', 'passthrough', '-c:v', 'tiff',
+                        '-compression_algo', 'lzw', '-pix_fmt', 'rgb24',
+                        os.path.join(folder.replace('%', '%%'), f'{branch:05d}_%06d.tif')]
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as graph_file:
+            graph_file.write(';'.join(graph))
+        self._cmd = [FFmpegQos._executable, '-y', '-hide_banner', '-nostats', '-loglevel', self.loglevel,
+                     '-progress', 'pipe:2', '-stats_period', '10',
+                     '-hwaccel', 'auto', '-i', self.main.videoSrc, '-/filter_complex', graph_file.name] + outputs
+        logger.debug("FFmpeg frames cmd: %s", self._cmd)
+        times = [[] for _ in chunks]
+        try:
+            process = subprocess.Popen(self._cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                       encoding='utf-8', errors='replace', shell=False)
+            for line in process.stderr:
+                shown = re.match(r'\[showinfo@frames(\d+) @ [^\]]*\] .* pts_time:(\S+)', line)
+                if shown:
+                    times[int(shown.group(1))].append(float(shown.group(2)))
+                elif line.startswith('[showinfo@frames'):
+                    continue
+                elif line.startswith('out_time='):
+                    logger.info("Low frames pass: %s of the distorted input", line.strip().split('=', 1)[1])
+                elif not re.match(r'[a-z0-9_]+=', line):
+                    sys.stderr.write(line)
+            process.wait()
+        finally:
+            os.remove(graph_file.name)
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, self._cmd)
+        written = []
+        for branch, (chunk, selection) in enumerate(zip(chunks, selections)):
+            for index, (number, pts_time) in enumerate(zip(selection, times[branch]), start=1):
+                if number in chunk:
+                    written.append((number, os.path.join(folder, f'{branch:05d}_{index:06d}.tif'), pts_time))
+        return written
 
     def clearFilters(self):
         self.psnrFilter = []
