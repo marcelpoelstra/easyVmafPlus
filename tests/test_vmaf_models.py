@@ -9,9 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from easyVmafPlus import FFmpeg
-from easyVmafPlus.cli import _read_scores
 from easyVmafPlus.config import ffmpeg as FFMPEG
-from easyVmafPlus.FFmpeg import FFmpegQos, ModelConfig, check_ffmpeg, select_models, v1_model_path
+from easyVmafPlus.FFmpeg import FFmpegQos, ModelConfig, check_ffmpeg, read_vmaf_log, select_models, v1_model_path
 from easyVmafPlus.Vmaf import vmaf
 
 BS = "\\"
@@ -254,14 +253,14 @@ class TestCheckFfmpeg:
 
 
 @needs_v1
-class TestReadScores:
-    """cli._read_scores reads every score name of a libvmaf log in json, xml and csv."""
+class TestReadVmafLog:
+    """read_vmaf_log reads every score name of a libvmaf log in json, xml and csv."""
 
     @pytest.mark.parametrize("log_fmt", ['json', 'xml', 'csv'])
     def test_v1_hd_log(self, tmp_path, log_fmt):
         models = select_models('HD')
         log_path = str(tmp_path / f'log.{log_fmt}')
         assert _run_libvmaf(FFmpegQos._build_model_string(models), log_fmt, log_path, LOG_INPUT) == 0
-        scores = _read_scores(log_path, log_fmt, [m.name for m in models])
-        assert list(scores) == ['vmaf_v1_hd', 'vmaf_v1_hd_phone']
-        assert len(scores['vmaf_v1_hd']) == len(scores['vmaf_v1_hd_phone']) > 0
+        log = read_vmaf_log(log_path)
+        assert list(log.scores) == ['vmaf_v1_hd', 'vmaf_v1_hd_phone']
+        assert len(log.scores['vmaf_v1_hd']) == len(log.scores['vmaf_v1_hd_phone']) == len(log.frame_numbers) > 0

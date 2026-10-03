@@ -2,6 +2,7 @@
 and python -m easyVmafPlus."""
 
 import importlib
+import importlib.metadata
 import os
 import subprocess
 import sys
@@ -55,3 +56,9 @@ def test_module_without_arguments():
     result = _python('-m', 'easyVmafPlus', env=os.environ)
     assert (result.returncode, result.stdout) == (1, '')
     assert result.stderr.startswith('usage: easyVmafPlus [-h] -d D -r R ')
+
+
+def test_console_scripts():
+    scripts = {entry.name: entry.value for entry in importlib.metadata.entry_points(group='console_scripts')
+               if entry.name.startswith('easyVmafPlus')}
+    assert scripts == {'easyVmafPlus': 'easyVmafPlus.cli:main', 'easyVmafPlusPlot': 'easyVmafPlus.plot:main'}
