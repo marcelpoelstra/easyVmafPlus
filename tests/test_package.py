@@ -40,8 +40,11 @@ def test_without_environment_variables():
 
 
 def test_public_api():
-    assert easyVmafPlus.__all__ == ['vmaf', 'UnsupportedFramerateError', 'FFprobe', 'FFmpegQos', 'inputFFmpeg']
+    assert easyVmafPlus.__all__ == ['vmaf', 'UnsupportedFramerateError', 'UnsupportedModelConfigError',
+                                    'UnsupportedRangeError', 'FFprobe', 'FFmpegQos', 'inputFFmpeg']
     assert (easyVmafPlus.vmaf, easyVmafPlus.UnsupportedFramerateError) == (Vmaf.vmaf, Vmaf.UnsupportedFramerateError)
+    assert (easyVmafPlus.UnsupportedModelConfigError, easyVmafPlus.UnsupportedRangeError) == (
+        Vmaf.UnsupportedModelConfigError, Vmaf.UnsupportedRangeError)
     assert (easyVmafPlus.FFprobe, easyVmafPlus.FFmpegQos, easyVmafPlus.inputFFmpeg) == (
         FFmpeg.FFprobe, FFmpeg.FFmpegQos, FFmpeg.inputFFmpeg)
 

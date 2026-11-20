@@ -13,6 +13,7 @@ met_ref.ts
 video_samples/BBB_sampleA_distorted_vmaf.json
 .gitignore
 video_samples/BBB_sampleB_distorted_vmaf.json
+video_samples/*_summary.json
 met_2000_vmaf.json
 requirements.txt
 workdocuments/

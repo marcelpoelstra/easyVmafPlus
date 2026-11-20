@@ -25,6 +25,7 @@ SOFTWARE.
 
 from . import config
 from dataclasses import dataclass, field
+from fractions import Fraction
 from statistics import mean
 from typing import Dict, List, Optional
 import csv
@@ -41,74 +42,165 @@ from ffmpeg_progress_yield import FfmpegProgress
 logger = logging.getLogger(__name__)
 
 
-# VMAF v1 model files: copies of model/vmaf_v1.0.16 and model/vmaf_v1.0.16_hfr
-# of Netflix/vmaf v3.2.1, under the licence in models/LICENSE
+# Model files: copies of model/vmaf_v1.0.16 and model/vmaf_v1.0.16_hfr of Netflix/vmaf v3.2.1,
+# and of model/hdr_vmaf_v1.1.8 and model/hdr_vmaf_v1.1.8_hfr of Netflix/vmaf a6ed0f18, under
+# the licence in models/LICENSE
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 VMAF_V1_VERSION = 'vmaf_v1.0.16'
+HDR_VMAF_VERSION = 'hdr_vmaf_v1.1.8'
+MODEL_STEMS = {'v1': VMAF_V1_VERSION, 'hdr': HDR_VMAF_VERSION}
 
 # Per model generation and -model value, each model: (score name in the VMAF log,
-# label in the results, source, extra model parameters). The source of a v0 model
-# is its libvmaf built-in version, the source of a v1 model its model file variant.
+# label in the results, source, extra model parameters, view). The source of a v0 model
+# is its libvmaf built-in version, the source of a v1 or hdr model its model file variant.
+# The view is the viewing distance of a v1 or hdr model in screen heights, None for v0.
 VMAF_MODELS = {
     'v0': {
         'HD': [
-            ('vmaf_hd', 'VMAF HD', 'vmaf_v0.6.1', {}),
-            ('vmaf_hd_neg', 'VMAF Neg', 'vmaf_v0.6.1neg', {}),
-            ('vmaf_hd_phone', 'VMAF Phone', 'vmaf_v0.6.1', {'enable_transform': 'true'}),
+            ('vmaf_hd', 'VMAF HD', 'vmaf_v0.6.1', {}, None),
+            ('vmaf_hd_neg', 'VMAF Neg', 'vmaf_v0.6.1neg', {}, None),
+            ('vmaf_hd_phone', 'VMAF Phone', 'vmaf_v0.6.1', {'enable_transform': 'true'}, None),
         ],
         '4K': [
-            ('vmaf_4k', 'VMAF 4K', 'vmaf_4k_v0.6.1', {}),
+            ('vmaf_4k', 'VMAF 4K', 'vmaf_4k_v0.6.1', {}, None),
         ],
     },
     'v1': {
         'HD': [
-            ('vmaf_v1_hd', 'VMAF v1 HD', '3d0h', {}),
-            ('vmaf_v1_hd_phone', 'VMAF v1 Phone', '5d0h', {}),
+            ('vmaf_v1_hd', 'VMAF v1 HD', '3d0h', {}, '3h'),
+            ('vmaf_v1_hd_phone', 'VMAF v1 Phone', '5d0h', {}, '5h'),
         ],
         '4K': [
-            ('vmaf_v1_4k', 'VMAF v1 4K', '1d5h_2160', {}),
-            ('vmaf_v1_4k_3h', 'VMAF v1 4K 3H', '3d0h_2160', {}),
+            ('vmaf_v1_4k', 'VMAF v1 4K', '1d5h_2160', {}, '1.5h'),
+            ('vmaf_v1_4k_3h', 'VMAF v1 4K 3H', '3d0h_2160', {}, '3h'),
+        ],
+    },
+    'hdr': {
+        'HD': [
+            ('hdr_vmaf_v1_hd', 'HDR-VMAF v1 HD', '3d0h', {}, '3h'),
+            ('hdr_vmaf_v1_hd_phone', 'HDR-VMAF v1 Phone', '5d0h', {}, '5h'),
+        ],
+        '4K': [
+            ('hdr_vmaf_v1_4k', 'HDR-VMAF v1 4K', '1d5h_2160', {}, '1.5h'),
+            ('hdr_vmaf_v1_4k_3h', 'HDR-VMAF v1 4K 3H', '3d0h_2160', {}, '3h'),
         ],
     },
 }
+
+VMAF_VERSIONS = ('1', '0.6')
+VIEW_ALIASES = {'phone': '5h'}
+
+# Per frame, libvmaf allocates two pictures, 50 MB each at 4K 4:4:4 16 bits, above glibc's
+# mmap threshold; keeping them on the heap measured 10.5 to 19.8 fps per process upstream
+# (upstream easyvmaf/ffmpeg.py:65-70)
+_VMAF_GLIBC_TUNABLES = 'glibc.malloc.mmap_max=0:glibc.malloc.trim_threshold=1073741824'
+
+
+def _vmaf_env():
+    """
+    Environment of the ffmpeg process that runs libvmaf, or None to inherit ours: the
+    malloc tunables on Linux only, unless GLIBC_TUNABLES is already set.
+    """
+    if not sys.platform.startswith('linux') or 'GLIBC_TUNABLES' in os.environ:
+        return None
+    return {**os.environ, 'GLIBC_TUNABLES': _VMAF_GLIBC_TUNABLES}
+
+
+def _cleanup_interrupted_process(process):
+    """Stop and reap the ffmpeg process of an interrupted run"""
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning("Could not reap interrupted FFmpeg process: %s", error)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 @dataclass
 class ModelConfig:
     """
     One model of the libvmaf model= option: its score name in the VMAF log, its
-    label in the results, and its built-in version (v0) or model file path (v1).
+    label in the results, its built-in version (v0) or model file path (v1, hdr),
+    and its view for a v1 or hdr model.
     """
     name: str
     label: str
     version: Optional[str] = None
     path: Optional[str] = None
     params: Dict[str, str] = field(default_factory=dict)
+    view: Optional[str] = None
 
 
-def v1_model_path(variant, hfr=False):
-    """Bundled VMAF v1 model file, e.g. models/vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_3d0h.json"""
-    stem = f'{VMAF_V1_VERSION}_hfr' if hfr else VMAF_V1_VERSION
+def v1_model_path(variant, hfr=False, stem=VMAF_V1_VERSION):
+    """Bundled model file, e.g. models/vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_3d0h.json"""
+    stem = f'{stem}_hfr' if hfr else stem
     return os.path.join(MODELS_DIR, stem, f'{stem}_{variant}.json')
 
 
-def select_models(model, vmaf_v0=False, hfr=False):
+def _generation(version, dynamic_range):
+    if version == '0.6':
+        return 'v0'
+    return 'hdr' if dynamic_range == 'hdr' else 'v1'
+
+
+def _filter_views(entries, model, views):
+    valid = [entry[4] for entry in entries]
+    wanted = []
+    for view in views:
+        canonical = VIEW_ALIASES.get(str(view).lower(), str(view).lower())
+        if canonical not in valid:
+            raise ValueError(f"View {view!r} is not available for -model {model}. Supported: {', '.join(valid)}")
+        wanted.append(canonical)
+    if not wanted:
+        raise ValueError(f"At least one view is required for -model {model}. Supported: {', '.join(valid)}")
+    return [entry for entry in entries if entry[4] in wanted]
+
+
+def select_models(model, vmaf_versions=('1',), views=None, hfr=False, dynamic_range='sdr'):
     """
-    The models of a run for -model HD or 4K: the v0.6.1 models with vmaf_v0,
-    otherwise the v1 models, in their HFR variants with hfr.
+    The models of a run for -model HD or 4K: per VMAF version in order, the v0.6.1 models
+    for '0.6', the v1 models for '1', or the HDR-VMAF models for '1' with dynamic_range
+    'hdr', in their HFR variants with hfr. views keeps the v1 or hdr models with those
+    viewing distances ('3h', '5h' or its alias 'phone', '1.5h'); None keeps every model
+    of the display.
     """
-    generation = 'v0' if vmaf_v0 else 'v1'
-    if model not in VMAF_MODELS[generation]:
-        raise ValueError(f"Invalid VMAF model: {model!r}. Supported: {', '.join(VMAF_MODELS[generation])}")
+    versions = []
+    for version in (str(v) for v in vmaf_versions):
+        if version not in VMAF_VERSIONS:
+            raise ValueError(f"Invalid VMAF version: {version!r}. Supported: {', '.join(VMAF_VERSIONS)}")
+        if version not in versions:
+            versions.append(version)
+    if not versions:
+        raise ValueError("At least one VMAF version is required")
+    if dynamic_range not in ('sdr', 'hdr'):
+        raise ValueError(f"Invalid dynamic range: {dynamic_range!r}. Supported: sdr, hdr")
+    if dynamic_range == 'hdr' and '0.6' in versions:
+        raise ValueError("VMAF 0.6 has no HDR models: HDR-VMAF is VMAF version 1 only")
     models: List[ModelConfig] = []
-    for name, label, source, params in VMAF_MODELS[generation][model]:
-        if vmaf_v0:
-            models.append(ModelConfig(name, label, version=source, params=dict(params)))
-        elif hfr:
-            models.append(ModelConfig(f'{name}_hfr', f'{label} HFR',
-                                      path=v1_model_path(source, hfr=True), params=dict(params)))
-        else:
-            models.append(ModelConfig(name, label, path=v1_model_path(source), params=dict(params)))
+    for version in versions:
+        generation = _generation(version, dynamic_range)
+        if model not in VMAF_MODELS[generation]:
+            raise ValueError(f"Invalid VMAF model: {model!r}. Supported: {', '.join(VMAF_MODELS[generation])}")
+        entries = VMAF_MODELS[generation][model]
+        if generation != 'v0' and views is not None:
+            entries = _filter_views(entries, model, views)
+        for name, label, source, params, view in entries:
+            if generation == 'v0':
+                models.append(ModelConfig(name, label, version=source, params=dict(params)))
+            elif hfr:
+                models.append(ModelConfig(f'{name}_hfr', f'{label} HFR',
+                                          path=v1_model_path(source, hfr=True, stem=MODEL_STEMS[generation]),
+                                          params=dict(params), view=view))
+            else:
+                models.append(ModelConfig(name, label,
+                                          path=v1_model_path(source, stem=MODEL_STEMS[generation]),
+                                          params=dict(params), view=view))
     return models
 
 
@@ -149,19 +241,19 @@ def create_unique_dir(path):
 
 def known_scores():
     """
-    The VMAF score names of VMAF_MODELS in their order, each v1 name followed by its HFR name, as
-    {score name: (label, score cap)}. The cap of a v1 model is the upper score_clip of its model
-    file; the v0 built-in models score up to 100.
+    The VMAF score names of VMAF_MODELS in their order, each v1 or hdr name followed by its
+    HFR name, as {score name: (label, score cap)}. The cap of a v1 or hdr model is the upper
+    score_clip of its model file; the v0 built-in models score up to 100.
     """
     scores = {}
     for generation, model_sets in VMAF_MODELS.items():
         for entries in model_sets.values():
-            for name, label, source, _ in entries:
+            for name, label, source, _, _ in entries:
                 if generation == 'v0':
                     scores[name] = (label, 100.0)
                     continue
                 for hfr in (False, True):
-                    with open(v1_model_path(source, hfr=hfr)) as model_file:
+                    with open(v1_model_path(source, hfr=hfr, stem=MODEL_STEMS[generation])) as model_file:
                         cap = float(json.load(model_file)['model_dict']['score_clip'][1])
                     scores[f'{name}_hfr' if hfr else name] = (f'{label} HFR' if hfr else label, cap)
     return scores
@@ -307,6 +399,12 @@ class FFmpegQos:
         self.invertedSrc = False
         self.vmafpath = None
         self.vmaf_cambi_heatmap_path = None
+        # Cap of the decoder and filter graph threads of ffmpeg: 1 for a sync pass, the
+        # CPU share for a job, None keeps ffmpeg's own threading
+        self._ffmpeg_threads = None
+        # The VMAF process of getVmaf without progress, and whether cancel stopped it
+        self._process = None
+        self._cancelled = False
 
     @staticmethod
     def _escape_filter_value(value, option_levels=1):
@@ -323,7 +421,11 @@ class FFmpegQos:
         return value
 
     def _commitBase(self):
-        return [FFmpegQos._executable, '-y', '-hide_banner', '-stats', '-loglevel', self.loglevel]
+        base = [FFmpegQos._executable, '-y', '-hide_banner', '-stats', '-loglevel', self.loglevel]
+        if self._ffmpeg_threads:
+            # -lavfi is a complex filtergraph: -filter_threads applies to simple ones only
+            base += ['-filter_complex_threads', str(self._ffmpeg_threads)]
+        return base
 
     def _commit(self):
         """build the final cmd to run"""
@@ -331,10 +433,19 @@ class FFmpegQos:
                      self._commitFilters() + self._commitOutputs())
 
     def _commitInputs(self):
-        """build the cmd for the inputs files, with hardware accelerated decoding for each input"""
-        return ['-hwaccel', 'auto', '-i', self.main.videoSrc,
-                '-hwaccel', 'auto', '-i', self.ref.videoSrc,
-                '-map', '0:v', '-map', '1:v']
+        """
+        The input files, with hardware accelerated decoding for each. No -map: the -lavfi
+        output is mapped on its own, and mapped unfiltered streams would decode both files
+        to the end despite the trims. -an -sn -dn stop the selection of other streams.
+        A seek keeps the original timestamps, so the filters see the timeline of a run
+        from the start.
+        """
+        decoder = ['-threads', str(self._ffmpeg_threads)] if self._ffmpeg_threads else []
+        timestamps = ['-copyts', '-start_at_zero'] if self.main.seekOptions or self.ref.seekOptions else []
+        return (timestamps
+                + decoder + ['-hwaccel', 'auto'] + self.main.extraOptions + ['-i', self.main.videoSrc]
+                + decoder + ['-hwaccel', 'auto'] + self.ref.extraOptions + ['-i', self.ref.videoSrc]
+                + ['-an', '-sn', '-dn'])
 
     def _commitOutputs(self):
         return ['-f', 'null', '-']
@@ -375,17 +486,54 @@ class FFmpegQos:
         logger.debug("FFmpeg PSNR cmd: %s", self._cmd)
         stdout = subprocess.check_output(
             self._cmd, stderr=subprocess.STDOUT, shell=False).decode('utf-8')
-        stdout = stdout.split(" ")
-        psnr = [s for s in stdout if "average" in s][0].split(":")[1]
-        return float(psnr)
+        averages = [s for s in stdout.split(" ") if "average" in s]
+        if not averages:
+            # The trims left no frame to compare, e.g. a start past the end
+            raise RuntimeError("the PSNR filter compared no frames")
+        return float(averages[0].split(":")[1])
 
-    def getVmaf(self, log_path=None, models=None, subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features=None, cambi_heatmap=False):
+    def getFirstFrameTimestamps(self):
+        """
+        Run the current chains until each one outputs its first frame. Returns
+        ((pts, time_base), (pts, time_base)) of the first frame of the main and ref
+        chains, in the time base of the end of each chain. Raises RuntimeError when
+        ffmpeg fails or a chain outputs no frame.
+        """
+        firsts = {}
+        filters = list(self.main.filtersList + self.ref.filtersList)
+        outputs = []
+        for name, stream in (('main', self.main), ('ref', self.ref)):
+            # Without its checksum showinfo also accepts hardware frames
+            filters.append(f'[{stream.lastOutputID}]showinfo@{name}=checksum=0[first_{name}]')
+            outputs += ['-map', f'[first_{name}]', '-frames:v', '1', '-f', 'null', '-']
+        # showinfo reports at the info level
+        loglevel = self.loglevel if self.loglevel == 'verbose' else 'info'
+        self._cmd = ([FFmpegQos._executable, '-y', '-hide_banner', '-loglevel', loglevel]
+                     + self._commitInputs() + ['-lavfi', ';'.join(filters)] + outputs)
+        logger.debug("FFmpeg first frame cmd: %s", self._cmd)
+        result = subprocess.run(self._cmd, capture_output=True, text=True, shell=False)
+        if result.returncode != 0:
+            detail = (result.stderr.strip().splitlines() or ['no diagnostic output'])[-1]
+            raise RuntimeError(f"FFmpeg first frame pass failed (exit code {result.returncode}): {detail}")
+        for name in ('main', 'ref'):
+            prefix = r'\[showinfo@%s @ [^\]]+\] ' % name
+            time_base = re.search(prefix + r'config in time_base: (\d+)/(\d+)', result.stderr)
+            frame = re.search(prefix + r'n:\s*0 pts:\s*(-?\d+)', result.stderr)
+            if not (time_base and frame):
+                raise RuntimeError(f"the {name} chain output no frame")
+            firsts[name] = (int(frame.group(1)),
+                            Fraction(int(time_base.group(1)), int(time_base.group(2))))
+        return firsts['main'], firsts['ref']
+
+    def getVmaf(self, log_path=None, models=None, subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features=None, cambi_heatmap=False, heatmap_path=None):
         if models is None:
             # the default of the former model='HD': the v0.6.1 HD models
-            models = select_models('HD', vmaf_v0=True)
+            models = select_models('HD', ('0.6',))
         log_fmt = output_fmt if output_fmt in ('xml', 'csv') else 'json'
         if log_path is None:
             log_path = os.path.splitext(self.main.videoSrc)[0] + f'_vmaf.{log_fmt}'
+        if heatmap_path is None:
+            heatmap_path = os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap'
         if threads == 0:
             threads = os.cpu_count()
         shortest = 1 if end_sync else 0
@@ -397,8 +545,7 @@ class FFmpegQos:
             log_file, self.vmafpath = create_unique_file(log_path)
             log_file.close()
             if features and cambi_heatmap:
-                self.vmaf_cambi_heatmap_path = create_unique_dir(
-                    os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap')
+                self.vmaf_cambi_heatmap_path = create_unique_dir(heatmap_path)
 
             params = (f'log_fmt={log_fmt}'
                       f':model={self._build_model_string(models)}'
@@ -417,15 +564,34 @@ class FFmpegQos:
             self._commit()
             logger.debug("FFmpeg VMAF cmd: %s", self._cmd)
 
+            # The malloc tunables on Linux; elsewhere the process inherits the environment as before
+            env = _vmaf_env()
+            popen_kwargs = {'env': env} if env is not None else {}
             if print_progress:
                 process = FfmpegProgress(self._cmd)
-                # run_command_with_progress raises RuntimeError when ffmpeg exits with an error
-                for progress in process.run_command_with_progress():
-                    logger.info("progress = %s%% - %s", progress,
-                                "\n".join(str(process.stderr).splitlines()[-9:-8]))
+                child = None
+                try:
+                    # run_command_with_progress raises RuntimeError when ffmpeg exits with an error
+                    for progress in process.run_command_with_progress(popen_kwargs=popen_kwargs or None):
+                        child = getattr(process, 'process', None)
+                        logger.info("progress = %s%% - %s", progress,
+                                    "\n".join(str(process.stderr).splitlines()[-9:-8]))
+                except (KeyboardInterrupt, SystemExit):
+                    _cleanup_interrupted_process(child or getattr(process, 'process', None))
+                    raise
             else:
-                process = subprocess.Popen(self._cmd, stdout=subprocess.PIPE, shell=False)
-                process.communicate()
+                if self._cancelled:
+                    raise RuntimeError("VMAF run cancelled")
+                process = subprocess.Popen(self._cmd, stdout=subprocess.PIPE, shell=False, **popen_kwargs)
+                self._process = process
+                # cancel sets the flag before reading _process: one of the two sees the other
+                if self._cancelled:
+                    process.kill()
+                try:
+                    process.communicate()
+                except (KeyboardInterrupt, SystemExit):
+                    _cleanup_interrupted_process(process)
+                    raise
                 if process.returncode != 0:
                     raise subprocess.CalledProcessError(process.returncode, self._cmd)
         except BaseException:
@@ -433,6 +599,16 @@ class FFmpegQos:
             raise
 
         return process
+
+    def cancel(self):
+        """
+        Stop the VMAF process of getVmaf (without progress) from another thread, now or as
+        soon as it starts; getVmaf then raises.
+        """
+        self._cancelled = True
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.kill()
 
     def _removeEmptyOutputs(self):
         """The reserved VMAF log and heatmap folder of a failed or interrupted run go when still empty"""
@@ -512,8 +688,13 @@ class inputFFmpeg:
     - setDeintFrameFilter()
     - setDeintFieldFilter()
     - setTrimFilter()
+    - setPreTrimFilter(), setEndTrimFilter(), setRangeTrimFilter()
+    - setPtsShiftFilter()
     - setFpsFilter()
     - setFormatFilter()
+    - setColorParamsFilter()
+    - setSdrConversionFilter()
+    - setSeek() (input option)
     - clearFilters()
     '''
 
@@ -522,8 +703,13 @@ class inputFFmpeg:
         self.id = input_id
         self.videoSrc = videoSrc
         self.filtersList = []
-        self.extraOptions = []
+        self.seekOptions = []
         self.lastOutputID = f'{str(self.id)}:v'
+
+    @property
+    def extraOptions(self):
+        """Input options, placed before -i"""
+        return list(self.seekOptions)
 
     def _setFilter(self, filter):
         self.filtersList.append(filter)
@@ -582,21 +768,123 @@ class inputFFmpeg:
         self._updateOutputId(outputID)
         return
 
+    def setPreTrimFilter(self, start):
+        """
+        Drop the frames before start, keeping their timestamps: the filters that follow see
+        the original timeline, and a later setTrimFilter cuts at the same instant as without
+        this filter.
+        """
+        inputID, outputID = self._newInOutForFilter()
+        self._setFilter(f'[{inputID}]trim=start={start}[{outputID}]')
+        self._updateOutputId(outputID)
+
+    def setEndTrimFilter(self, end):
+        """Drop the frames from end (seconds) on, keeping the timestamps"""
+        inputID, outputID = self._newInOutForFilter()
+        self._setFilter(f'[{inputID}]trim=end={end}[{outputID}]')
+        self._updateOutputId(outputID)
+
+    def setRangeTrimFilter(self, start, end=None):
+        """Keep the frames in [start, end) seconds, to the end without end, then start them at 0"""
+        inputID, outputID = self._newInOutForFilter()
+        bounds = f'start={start}' + (f':end={end}' if end is not None else '')
+        self._setFilter(f'[{inputID}]trim={bounds}, setpts=PTS-STARTPTS[{outputID}]')
+        self._updateOutputId(outputID)
+
+    def setPtsShiftFilter(self, pts):
+        """Subtract pts, in time base units, from every timestamp"""
+        inputID, outputID = self._newInOutForFilter()
+        self._setFilter(f'[{inputID}]setpts=PTS-{int(pts)}[{outputID}]')
+        self._updateOutputId(outputID)
+
+    def setSeek(self, seconds):
+        """
+        Start reading the input at seconds (-ss before -i): ffmpeg decodes from the keyframe
+        before it and drops the frames up to it. FFmpegQos then keeps the original timestamps
+        (-copyts -start_at_zero).
+        """
+        self.seekOptions = ['-ss', f'{seconds:.6f}']
+
     def setFpsFilter(self, fps):
         inputID, outputID = self._newInOutForFilter()
         fpsFilter = f'[{inputID}]fps=fps={fps}[{outputID}]'
         self._setFilter(fpsFilter)
         self._updateOutputId(outputID)
 
-    def setFormatFilter(self, pix_fmt):
+    def setFormatFilter(self, pix_fmt, color_space=None, color_range=None):
+        """
+        Convert to pix_fmt and, when given, to the color_space matrix (e.g. bt2020nc) and
+        the color_range (tv, pc) in the same conversion.
+        """
+        options = pix_fmt
+        if color_space:
+            options += f':color_spaces={color_space}'
+        if color_range:
+            options += f':color_ranges={color_range}'
         inputID, outputID = self._newInOutForFilter()
-        formatFilter = f'[{inputID}]format={pix_fmt}[{outputID}]'
+        formatFilter = f'[{inputID}]format={options}[{outputID}]'
         self._setFilter(formatFilter)
+        self._updateOutputId(outputID)
+
+    def setColorParamsFilter(self, color_range, primaries, trc, matrix):
+        """Tag the frames with this colorimetry (FFmpeg names: tv, bt2020, smpte2084, bt2020nc) without converting them"""
+        inputID, outputID = self._newInOutForFilter()
+        self._setFilter(f'[{inputID}]setparams=range={color_range}:color_primaries={primaries}'
+                        f':color_trc={trc}:colorspace={matrix}[{outputID}]')
+        self._updateOutputId(outputID)
+
+    def setSdrConversionFilter(self, width, height):
+        """
+        Convert tagged frames, e.g. PQ BT.2020, to BT.709 limited range at the given size with
+        the colour options of the scale filter (FFmpeg 9.0), so the TIFF frames are viewable.
+        """
+        inputID, outputID = self._newInOutForFilter()
+        self._setFilter(f'[{inputID}]scale={width}:{height}:out_primaries=bt709:out_transfer=bt709'
+                        f':out_color_matrix=bt709:out_range=tv[{outputID}]')
         self._updateOutputId(outputID)
 
     def clearFilters(self):
         self.filtersList = []
         self.lastOutputID = f'{str(self.id)}:v'
+        # The input options belong to the chain they were set for
+        self.seekOptions = []
+
+
+# PQ BT.2020 tags and 10 bit frames for the HDR-VMAF probe
+HDR_PROBE_CHAIN = ('setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,'
+                   'format=yuv420p10le')
+
+
+def _probe_model_frame(model_path, chain=None):
+    """
+    True when libvmaf scores five 320x240 frames with the bundled model file, each input
+    through chain first. The v1 models fail on 64x64 frames ("no feature
+    'cambi_hrs_1080_cmxv_17_vlt_0.06' at index 0"); 320x240 frames pass.
+    """
+    source = 'nullsrc=s=320x240:r=25:d=0.2'
+    model = FFmpegQos._escape_filter_value(model_path, option_levels=2)
+    vmaf = f'libvmaf=model=path={model}:log_fmt=json:log_path={os.devnull}'
+    if chain:
+        graph = f'[0:v]{chain}[dis];[1:v]{chain}[ref];[dis][ref]{vmaf}'
+    else:
+        graph = vmaf
+    probe_cmd = [
+        FFmpegQos._executable,
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', source,
+        '-f', 'lavfi', '-i', source,
+        '-lavfi', graph,
+        '-f', 'null', '-'
+    ]
+    return subprocess.run(probe_cmd, capture_output=True, text=True).returncode == 0
+
+
+def probe_hdr_vmaf():
+    """
+    True when libvmaf scores PQ tagged frames with the bundled hdr_vmaf_v1.1.8_3d0h model:
+    that needs a libvmaf built with zimg and an FFmpeg that passes the frame colorimetry.
+    """
+    return _probe_model_frame(v1_model_path('3d0h', stem=HDR_VMAF_VERSION), HDR_PROBE_CHAIN)
 
 
 def check_ffmpeg():
@@ -609,6 +897,8 @@ def check_ffmpeg():
         'libvmaf':        True when 'ffmpeg -filters' lists libvmaf
         'builtin_models': False when libvmaf cannot load the built-in model vmaf_v0.6.1
         'v1_models':      True when libvmaf runs the bundled VMAF v1 model vmaf_v1.0.16_3d0h
+        'hdr_vmaf':       True when libvmaf runs the bundled HDR-VMAF model hdr_vmaf_v1.1.8_3d0h
+                          on PQ tagged frames
 
     Raises:
         RuntimeError: when the ffmpeg or ffprobe binary is not found or cannot be run
@@ -625,6 +915,7 @@ def check_ffmpeg():
         'libvmaf': False,
         'builtin_models': False,
         'v1_models': False,
+        'hdr_vmaf': False,
     }
 
     try:
@@ -635,7 +926,7 @@ def check_ffmpeg():
         raise RuntimeError(f"cannot run '{e.filename}': {e.strerror}") from None
 
     # Release builds print "ffmpeg version 7.1" or "ffmpeg version 7.1.1",
-    # dev builds "ffmpeg version N-111825-gabcdef123"
+    # dev builds "ffmpeg version N-111825-gabcdef123" or "ffmpeg version git-88c46fce27e3"
     match = re.search(r'ffmpeg version (\d+)\.(\d+)', version_output)
     if match:
         major, minor = int(match.group(1)), int(match.group(2))
@@ -662,16 +953,6 @@ def check_ffmpeg():
     probe = subprocess.run(probe_cmd, capture_output=True, text=True)
     result['builtin_models'] = 'could not load libvmaf model' not in probe.stderr + probe.stdout
 
-    # The v1 models fail on the 64x64 frames of the probe above, with "no feature
-    # 'cambi_hrs_1080_cmxv_17_vlt_0.06' at index 0"; 320x240 frames pass
-    v1_model = FFmpegQos._escape_filter_value(v1_model_path('3d0h'), option_levels=2)
-    v1_probe_cmd = [
-        FFmpegQos._executable,
-        '-hide_banner', '-loglevel', 'error',
-        '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
-        '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
-        '-lavfi', f'libvmaf=model=path={v1_model}:log_fmt=json:log_path={os.devnull}',
-        '-f', 'null', '-'
-    ]
-    result['v1_models'] = subprocess.run(v1_probe_cmd, capture_output=True, text=True).returncode == 0
+    result['v1_models'] = _probe_model_frame(v1_model_path('3d0h'))
+    result['hdr_vmaf'] = probe_hdr_vmaf()
     return result

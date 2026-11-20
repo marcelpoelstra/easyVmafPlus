@@ -11,8 +11,11 @@ from types import SimpleNamespace
 import pytest
 
 from easyVmafPlus import FFmpeg
-from easyVmafPlus.FFmpeg import (FFmpegQos, FFprobe, ModelConfig, check_ffmpeg, create_unique_dir,
-                                 create_unique_file, inputFFmpeg, known_scores, read_vmaf_log, v1_model_path)
+from fractions import Fraction
+
+from easyVmafPlus.FFmpeg import (FFmpegQos, FFprobe, HDR_PROBE_CHAIN, HDR_VMAF_VERSION, ModelConfig, check_ffmpeg,
+                                 create_unique_dir, create_unique_file, inputFFmpeg, known_scores, read_vmaf_log,
+                                 v1_model_path, _cleanup_interrupted_process, _vmaf_env)
 
 DATA = os.path.join(os.path.dirname(__file__), 'data')
 # Per-frame scores of tests/data/vmaf_v1_hd.* and tests/data/vmaf_v0_hd.json
@@ -65,8 +68,9 @@ def popen(monkeypatch):
         created = []
 
         class FakePopen:
-            def __init__(self, cmd, stdout, shell):
+            def __init__(self, cmd, stdout, shell, **kwargs):
                 self.call = (cmd, stdout, shell)
+                self.kwargs = kwargs
                 self.returncode = None
                 created.append(self)
 
@@ -145,9 +149,20 @@ class TestInputFFmpeg:
         ('setDeintFrameFilter', (), '[0:v]yadif=0:-1:0[input0_0]'),
         ('setDeintFieldFilter', (), '[0:v]yadif=1:-1:0[input0_0]'),
         ('setTrimFilter', (1.5, 8.5), '[0:v]trim=start=1.5:duration=8.5, setpts=PTS-STARTPTS[input0_0]'),
+        ('setPreTrimFilter', (1.0,), '[0:v]trim=start=1.0[input0_0]'),
+        ('setEndTrimFilter', (9.5,), '[0:v]trim=end=9.5[input0_0]'),
+        ('setRangeTrimFilter', (0.31, 4.47), '[0:v]trim=start=0.31:end=4.47, setpts=PTS-STARTPTS[input0_0]'),
+        ('setRangeTrimFilter', (0.31,), '[0:v]trim=start=0.31, setpts=PTS-STARTPTS[input0_0]'),
+        ('setPtsShiftFilter', (12,), '[0:v]setpts=PTS-12[input0_0]'),
         ('setFpsFilter', (29.97003,), '[0:v]fps=fps=29.97003[input0_0]'),
         ('setFormatFilter', ('yuv420p10le',), '[0:v]format=yuv420p10le[input0_0]'),
-    ], ids=["scale", "scale-algo", "offset", "deint-frame", "deint-field", "trim", "fps", "format"])
+        ('setFormatFilter', ('yuv420p10le', 'bt2020nc', 'tv'), '[0:v]format=yuv420p10le:color_spaces=bt2020nc:color_ranges=tv[input0_0]'),
+        ('setColorParamsFilter', ('tv', 'bt2020', 'smpte2084', 'bt2020nc'),
+         '[0:v]setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc[input0_0]'),
+        ('setSdrConversionFilter', (1920, 1080),
+         '[0:v]scale=1920:1080:out_primaries=bt709:out_transfer=bt709:out_color_matrix=bt709:out_range=tv[input0_0]'),
+    ], ids=["scale", "scale-algo", "offset", "deint-frame", "deint-field", "trim", "pre-trim", "end-trim", "range-trim",
+            "range-trim-open", "pts-shift", "fps", "format", "format-color", "color-params", "sdr-conversion"])
     def test_filter(self, method, args, expected):
         stream = inputFFmpeg('main.mp4', input_id=0)
         getattr(stream, method)(*args)
@@ -167,10 +182,19 @@ class TestInputFFmpeg:
     def test_clear_filters(self):
         stream = inputFFmpeg('ref.mp4', input_id=1)
         stream.setFpsFilter(25)
+        stream.setSeek(2)
         stream.clearFilters()
-        assert (stream.filtersList, stream.lastOutputID) == ([], '1:v')
+        assert (stream.filtersList, stream.lastOutputID, stream.seekOptions, stream.extraOptions) == ([], '1:v', [], [])
         stream.setFpsFilter(25)
         assert stream.filtersList == ['[1:v]fps=fps=25[input1_0]']
+
+    def test_seek(self):
+        stream = inputFFmpeg('ref.mp4', input_id=1)
+        stream.setSeek(2.5)
+        assert stream.seekOptions == ['-ss', '2.500000']
+        assert stream.extraOptions == ['-ss', '2.500000']
+        stream.extraOptions.append('x')
+        assert stream.seekOptions == ['-ss', '2.500000']
 
 
 class TestFFmpegQosCommand:
@@ -184,10 +208,26 @@ class TestFFmpegQosCommand:
         qos._commit()
         assert qos._cmd == ['ffmpeg', '-y', '-hide_banner', '-stats', '-loglevel', 'info',
                             '-hwaccel', 'auto', '-i', 'main.mp4', '-hwaccel', 'auto', '-i', 'ref.mp4',
-                            '-map', '0:v', '-map', '1:v',
+                            '-an', '-sn', '-dn',
                             '-lavfi', '[0:v]scale=1920:1080:flags=bicubic[input0_0];'
                                       '[1:v]fps=fps=25[input1_0];[input0_0][input1_0]psnr',
                             '-f', 'null', '-']
+
+    def test_threads_and_seek(self):
+        qos = FFmpegQos('main.mp4', 'ref.mp4')
+        qos._ffmpeg_threads = 1
+        qos.main.setSeek(2)
+        qos._commit()
+        assert qos._cmd[:21] == ['ffmpeg', '-y', '-hide_banner', '-stats', '-loglevel', 'info', '-filter_complex_threads', '1',
+                                 '-copyts', '-start_at_zero', '-threads', '1', '-hwaccel', 'auto', '-ss', '2.000000', '-i', 'main.mp4',
+                                 '-threads', '1', '-hwaccel']
+        assert qos._cmd[21:27] == ['auto', '-i', 'ref.mp4', '-an', '-sn', '-dn']
+
+    def test_seek_on_reference_only(self):
+        qos = FFmpegQos('main.mp4', 'ref.mp4')
+        qos.ref.setSeek(0.5)
+        assert qos._commitInputs() == ['-copyts', '-start_at_zero', '-hwaccel', 'auto', '-i', 'main.mp4',
+                                       '-hwaccel', 'auto', '-ss', '0.500000', '-i', 'ref.mp4', '-an', '-sn', '-dn']
 
     def test_filter_order(self):
         qos = FFmpegQos('main.mp4', 'ref.mp4')
@@ -243,6 +283,54 @@ class TestGetPsnr:
         with pytest.raises(subprocess.CalledProcessError):
             FFmpegQos('main.mp4', 'ref.mp4').getPsnr()
 
+    def test_no_frames_compared(self, monkeypatch):
+        monkeypatch.setattr(subprocess, 'check_output', lambda cmd, stderr, shell: b'frame=0 fps=0.0\n')
+        with pytest.raises(RuntimeError, match=r"^the PSNR filter compared no frames$"):
+            FFmpegQos('main.mp4', 'ref.mp4').getPsnr()
+
+
+SHOWINFO_FIRST = ('[showinfo@{name} @ 0x1] config in time_base: 1/{den}, frame_rate: 30/1\n'
+                  '[showinfo@{name} @ 0x1] n:   0 pts:  {pts} pts_time:{t} duration:1 ...\n')
+
+
+class TestFirstFrameTimestamps:
+    """FFmpegQos.getFirstFrameTimestamps: one frame per chain through showinfo, parsed from stderr."""
+
+    @staticmethod
+    def run_with(monkeypatch, stderr, returncode=0):
+        calls = []
+
+        def run(cmd, capture_output, text, shell):
+            calls.append(cmd)
+            return SimpleNamespace(stdout='', stderr=stderr, returncode=returncode)
+        monkeypatch.setattr(subprocess, 'run', run)
+        return calls
+
+    def test_anchors(self, monkeypatch):
+        stderr = SHOWINFO_FIRST.format(name='main', den=15360, pts=512, t='0.033333') + SHOWINFO_FIRST.format(name='ref', den=30, pts=45, t='1.5')
+        calls = self.run_with(monkeypatch, stderr)
+        qos = FFmpegQos('main.mp4', 'ref.mp4')
+        qos.main.setSeek(1.0)
+        qos.main.setFpsFilter(30.0)
+        assert qos.getFirstFrameTimestamps() == ((512, Fraction(1, 15360)), (45, Fraction(1, 30)))
+        assert calls[0][:4] == ['ffmpeg', '-y', '-hide_banner', '-loglevel']
+        assert calls[0][4] == 'info'
+        assert calls[0][5:9] == ['-copyts', '-start_at_zero', '-hwaccel', 'auto']
+        assert calls[0][-16:] == ['-lavfi', '[0:v]fps=fps=30.0[input0_0];[input0_0]showinfo@main=checksum=0[first_main];'
+                                  '[1:v]showinfo@ref=checksum=0[first_ref]',
+                                  '-map', '[first_main]', '-frames:v', '1', '-f', 'null', '-',
+                                  '-map', '[first_ref]', '-frames:v', '1', '-f', 'null', '-']
+
+    def test_chain_without_frame(self, monkeypatch):
+        self.run_with(monkeypatch, SHOWINFO_FIRST.format(name='main', den=30, pts=0, t='0'))
+        with pytest.raises(RuntimeError, match=r"^the ref chain output no frame$"):
+            FFmpegQos('main.mp4', 'ref.mp4').getFirstFrameTimestamps()
+
+    def test_ffmpeg_error(self, monkeypatch):
+        self.run_with(monkeypatch, 'Something\nInvalid argument\n', returncode=1)
+        with pytest.raises(RuntimeError, match=r"^FFmpeg first frame pass failed \(exit code 1\): Invalid argument$"):
+            FFmpegQos('main.mp4', 'ref.mp4').getFirstFrameTimestamps()
+
 
 class TestGetVmaf:
     """FFmpegQos.getVmaf: the libvmaf filter options, the reserved output paths and the ffmpeg run."""
@@ -268,7 +356,48 @@ class TestGetVmaf:
         assert os.path.getsize(qos.vmafpath) == 0
         assert process is created[0]
         assert created[0].call == (qos._cmd, subprocess.PIPE, False)
+        assert created[0].kwargs == ({} if _vmaf_env() is None else {'env': _vmaf_env()})
         assert qos._cmd[-4:-3] == [';'.join(qos.main.filtersList + qos.ref.filtersList + qos.vmafFilter)]
+
+    def test_heatmap_path(self, popen, tmp_path):
+        popen()
+        qos = self.qos(tmp_path)
+        qos.getVmaf(models=[self.MODEL], threads=1, features='name=psnr|name=cambi', cambi_heatmap=True,
+                    heatmap_path=str(tmp_path / 'dist_cambi_heatmap_f0-9'))
+        assert qos.vmaf_cambi_heatmap_path == str(tmp_path / 'dist_cambi_heatmap_f0-9')
+        assert os.path.isdir(qos.vmaf_cambi_heatmap_path)
+
+    def test_cancel_before_run(self, popen, tmp_path):
+        created = popen()
+        qos = self.qos(tmp_path)
+        qos.cancel()
+        with pytest.raises(RuntimeError, match=r"^VMAF run cancelled$"):
+            qos.getVmaf(models=[self.MODEL], threads=1)
+        assert (created, os.listdir(tmp_path)) == ([], [])
+
+    def test_cancel_during_run(self, monkeypatch, tmp_path):
+        qos = self.qos(tmp_path)
+        killed = []
+
+        class FakePopen:
+            def __init__(self, cmd, stdout, shell, **kwargs):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                killed.append(True)
+                self.returncode = -9
+
+            def communicate(self):
+                qos.cancel()
+                self.returncode = self.returncode or -9
+                return b'', None
+        monkeypatch.setattr(subprocess, 'Popen', FakePopen)
+        with pytest.raises(subprocess.CalledProcessError):
+            qos.getVmaf(models=[self.MODEL], threads=1)
+        assert killed == [True]
 
     @pytest.mark.parametrize("output_fmt, log_fmt", [('json', 'json'), ('xml', 'xml'), ('csv', 'csv'), ('txt', 'json')])
     def test_log_format(self, popen, tmp_path, output_fmt, log_fmt):
@@ -340,7 +469,7 @@ class TestGetVmaf:
         qos = self.qos(tmp_path)
 
         class FakePopen:
-            def __init__(self, cmd, stdout, shell):
+            def __init__(self, cmd, stdout, shell, **kwargs):
                 self.returncode = None
 
             def communicate(self):
@@ -364,8 +493,19 @@ class TestGetVmaf:
 
     def test_interrupt_removes_empty_outputs(self, monkeypatch, tmp_path):
         class FakePopen:
-            def __init__(self, cmd, stdout, shell):
+            def __init__(self, cmd, stdout, shell, **kwargs):
                 self.returncode = None
+                self.stdin = self.stdout = self.stderr = None
+                self.killed = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                return -2
 
             def communicate(self):
                 raise SystemExit(0)
@@ -384,7 +524,8 @@ class TestGetVmaf:
                 self.stderr = '\n'.join(f'line {i}' for i in range(12))
                 created.append(self)
 
-            def run_command_with_progress(self):
+            def run_command_with_progress(self, popen_kwargs=None):
+                created[0].popen_kwargs = popen_kwargs
                 yield 50.0
                 yield 100.0
         monkeypatch.setattr(FFmpeg, 'FfmpegProgress', FakeProgress)
@@ -393,7 +534,48 @@ class TestGetVmaf:
             process = qos.getVmaf(models=[self.MODEL], threads=1, print_progress=True)
         assert process is created[0]
         assert created[0].cmd == qos._cmd
+        assert created[0].popen_kwargs == (None if _vmaf_env() is None else {'env': _vmaf_env()})
         assert [r.getMessage() for r in caplog.records] == ['progress = 50.0% - line 3', 'progress = 100.0% - line 3']
+
+
+class TestEnvironment:
+    """_vmaf_env and _cleanup_interrupted_process."""
+
+    @pytest.mark.parametrize("platform, tunables, expected", [
+        ('linux', None, 'glibc.malloc.mmap_max=0:glibc.malloc.trim_threshold=1073741824'),
+        ('linux', '', None), ('linux', 'glibc.malloc.perturb=1', None), ('darwin', None, None),
+    ], ids=["linux", "linux-empty", "linux-user", "darwin"])
+    def test_vmaf_env(self, monkeypatch, platform, tunables, expected):
+        monkeypatch.setattr(FFmpeg.sys, 'platform', platform)
+        monkeypatch.delenv('GLIBC_TUNABLES', raising=False)
+        if tunables is not None:
+            monkeypatch.setenv('GLIBC_TUNABLES', tunables)
+        env = _vmaf_env()
+        if expected is None:
+            assert env is None
+        else:
+            assert env['GLIBC_TUNABLES'] == expected and env['PATH'] == os.environ['PATH']
+
+    def test_cleanup(self):
+        events = []
+
+        class Process:
+            stdin = stderr = None
+
+            def __init__(self):
+                self.stdout = SimpleNamespace(close=lambda: events.append('close'))
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                events.append('kill')
+
+            def wait(self, timeout):
+                events.append(('wait', timeout))
+        _cleanup_interrupted_process(Process())
+        assert events == ['kill', ('wait', 5), 'close']
+        _cleanup_interrupted_process(None)
 
 
 @pytest.fixture
@@ -517,8 +699,10 @@ class TestKnownScores:
         scores = known_scores()
         assert list(scores) == ['vmaf_hd', 'vmaf_hd_neg', 'vmaf_hd_phone', 'vmaf_4k',
                                 'vmaf_v1_hd', 'vmaf_v1_hd_hfr', 'vmaf_v1_hd_phone', 'vmaf_v1_hd_phone_hfr',
-                                'vmaf_v1_4k', 'vmaf_v1_4k_hfr', 'vmaf_v1_4k_3h', 'vmaf_v1_4k_3h_hfr']
-        assert scores == {
+                                'vmaf_v1_4k', 'vmaf_v1_4k_hfr', 'vmaf_v1_4k_3h', 'vmaf_v1_4k_3h_hfr',
+                                'hdr_vmaf_v1_hd', 'hdr_vmaf_v1_hd_hfr', 'hdr_vmaf_v1_hd_phone', 'hdr_vmaf_v1_hd_phone_hfr',
+                                'hdr_vmaf_v1_4k', 'hdr_vmaf_v1_4k_hfr', 'hdr_vmaf_v1_4k_3h', 'hdr_vmaf_v1_4k_3h_hfr']
+        assert {name: value for name, value in scores.items() if not name.startswith('hdr_')} == {
             'vmaf_hd': ('VMAF HD', 100.0), 'vmaf_hd_neg': ('VMAF Neg', 100.0),
             'vmaf_hd_phone': ('VMAF Phone', 100.0), 'vmaf_4k': ('VMAF 4K', 100.0),
             'vmaf_v1_hd': ('VMAF v1 HD', 100.0), 'vmaf_v1_hd_hfr': ('VMAF v1 HD HFR', 100.0),
@@ -603,8 +787,9 @@ class TestCheckFfmpeg:
     def test_all_available(self, ffmpeg_run):
         calls = ffmpeg_run()
         assert check_ffmpeg() == {'version_str': '9.0', 'meets_minimum': True, 'libvmaf': True,
-                                  'builtin_models': True, 'v1_models': True}
+                                  'builtin_models': True, 'v1_models': True, 'hdr_vmaf': True}
         v1_model = FFmpegQos._escape_filter_value(v1_model_path('3d0h'), option_levels=2)
+        hdr_model = FFmpegQos._escape_filter_value(v1_model_path('3d0h', stem=HDR_VMAF_VERSION), option_levels=2)
         assert calls == [
             ['ffmpeg', '-version'],
             ['ffprobe', '-version'],
@@ -615,6 +800,10 @@ class TestCheckFfmpeg:
             ['ffmpeg', '-hide_banner', '-loglevel', 'error',
              '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2', '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
              '-lavfi', f'libvmaf=model=path={v1_model}:log_fmt=json:log_path={os.devnull}', '-f', 'null', '-'],
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+             '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2', '-f', 'lavfi', '-i', 'nullsrc=s=320x240:r=25:d=0.2',
+             '-lavfi', f'[0:v]{HDR_PROBE_CHAIN}[dis];[1:v]{HDR_PROBE_CHAIN}[ref];[dis][ref]'
+                       f'libvmaf=model=path={hdr_model}:log_fmt=json:log_path={os.devnull}', '-f', 'null', '-'],
         ]
 
     def test_no_libvmaf(self, ffmpeg_run):

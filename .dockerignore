@@ -17,3 +17,4 @@ dist/
 # VMAF output of local runs next to the samples
 video_samples/*_vmaf.*
 video_samples/*_cambi_heatmap*
+video_samples/*_summary.json
